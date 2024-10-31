@@ -6,7 +6,7 @@ use crate::noise::{Tunn, TunnResult};
 use std::mem;
 use std::ops::{Index, IndexMut};
 
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 #[cfg(feature = "mock-instant")]
 use mock_instant::Instant;
@@ -321,6 +321,15 @@ impl Tunn {
         } else {
             None
         }
+    }
+
+    pub fn last_handshake_time(&self) -> Option<std::time::Duration> {
+        self.time_since_last_handshake().and_then(|d| {
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .ok()
+                .map(|t| t - d)
+        })
     }
 
     pub fn persistent_keepalive(&self) -> Option<u16> {

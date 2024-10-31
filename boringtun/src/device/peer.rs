@@ -1,14 +1,14 @@
 // Copyright (c) 2019 Cloudflare, Inc. All rights reserved.
 // SPDX-License-Identifier: BSD-3-Clause
 
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use socket2::{Domain, Protocol, Type};
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::str::FromStr;
 
 use crate::device::{AllowedIps, Error};
-use crate::noise::{Tunn, TunnResult};
+use crate::noise::Tunn;
 
 #[derive(Default, Debug)]
 pub struct Endpoint {
@@ -17,8 +17,7 @@ pub struct Endpoint {
 }
 
 pub struct Peer {
-    /// The associated tunnel struct
-    pub(crate) tunnel: Tunn,
+    pub(crate) tunnel: Mutex<Tunn>,
     /// The index the tunnel uses
     index: u32,
     endpoint: RwLock<Endpoint>,
@@ -59,7 +58,7 @@ impl Peer {
         preshared_key: Option<[u8; 32]>,
     ) -> Peer {
         Peer {
-            tunnel,
+            tunnel: Mutex::new(tunnel),
             index,
             endpoint: RwLock::new(Endpoint {
                 addr: endpoint,
@@ -68,10 +67,6 @@ impl Peer {
             allowed_ips: allowed_ips.iter().map(|ip| (ip, ())).collect(),
             preshared_key,
         }
-    }
-
-    pub fn update_timers<'a>(&mut self, dst: &'a mut [u8]) -> TunnResult<'a> {
-        self.tunnel.update_timers(dst)
     }
 
     pub fn endpoint(&self) -> parking_lot::RwLockReadGuard<'_, Endpoint> {
@@ -150,14 +145,6 @@ impl Peer {
 
     pub fn allowed_ips(&self) -> impl Iterator<Item = (IpAddr, u8)> + '_ {
         self.allowed_ips.iter().map(|(_, ip, cidr)| (ip, cidr))
-    }
-
-    pub fn time_since_last_handshake(&self) -> Option<std::time::Duration> {
-        self.tunnel.time_since_last_handshake()
-    }
-
-    pub fn persistent_keepalive(&self) -> Option<u16> {
-        self.tunnel.persistent_keepalive()
     }
 
     pub fn preshared_key(&self) -> Option<&[u8; 32]> {

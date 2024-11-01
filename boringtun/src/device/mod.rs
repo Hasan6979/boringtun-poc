@@ -54,6 +54,7 @@ const HANDSHAKE_RATE_LIMIT: u64 = 100; // The number of handshakes per second we
 
 const MAX_UDP_SIZE: usize = (1 << 16) - 1;
 const MAX_ITR: usize = 100; // Number of packets to handle per handler call
+const WG_PORT: u16 = 53115;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -170,7 +171,7 @@ impl DeviceHandle {
     pub fn new(name: &str, config: DeviceConfig) -> Result<DeviceHandle, Error> {
         let n_threads = config.n_threads;
         let mut wg_interface = Device::new(name, config)?;
-        wg_interface.open_listen_socket(0)?; // Start listening on a random port
+        wg_interface.open_listen_socket(WG_PORT)?; // Start listening on a random port
 
         let interface_lock = Arc::new(Lock::new(wg_interface));
 

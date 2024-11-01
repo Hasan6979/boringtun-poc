@@ -8,6 +8,8 @@ pub mod rate_limiter;
 mod session;
 mod timers;
 
+use session::Session;
+
 use crate::noise::errors::WireGuardError;
 use crate::noise::handshake::Handshake;
 use crate::noise::rate_limiter::RateLimiter;
@@ -251,7 +253,13 @@ impl Tunn {
         let current = self.current;
         if let Some(ref session) = self.sessions[current % N_SESSIONS] {
             // Send the packet using an established session
-            let packet = session.format_packet_data(src, dst);
+            let packet = Session::encrypt_data_pkt(
+                &session.sending_key_counter,
+                session.sending_index,
+                session.sender.clone(),
+                src,
+                dst,
+            );
             self.timer_tick(TimerName::TimeLastPacketSent);
             // Exclude Keepalive packets from timer update.
             if !src.is_empty() {
@@ -353,9 +361,17 @@ impl Tunn {
 
         let session = self.handshake.receive_handshake_response(p)?;
 
-        let keepalive_packet = session.format_packet_data(&[], dst);
+        let keepalive_packet = {
+            Session::encrypt_data_pkt(
+                &session.sending_key_counter,
+                session.sending_index,
+                session.sender.clone(),
+                &[],
+                dst,
+            )
+        };
         // Store new session in ring buffer
-        let l_idx = session.local_index();
+        let l_idx = session.receiving_index as usize;
         let index = l_idx % N_SESSIONS;
         self.sessions[index] = Some(session);
 
@@ -418,7 +434,7 @@ impl Tunn {
                 tracing::trace!(message = "No current session available", remote_idx = r_idx);
                 WireGuardError::NoCurrentSession
             })?;
-            session.receive_packet_data(packet, dst)?
+            session.decrypt_data_pkt(packet, dst)?
         };
 
         self.set_current_session(r_idx);

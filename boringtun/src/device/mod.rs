@@ -41,10 +41,11 @@ use crate::noise::rate_limiter::RateLimiter;
 use crate::noise::{Packet, Tunn, TunnResult};
 use crate::x25519;
 use allowed_ips::AllowedIps;
+use async_channel::{Receiver, Sender};
 use peer::{AllowedIP, Peer};
 use poll::{EventPoll, EventRef, WaitResult};
 use rand_core::{OsRng, RngCore};
-use socket2::{Domain, Protocol, Type};
+use socket2::{Domain, Protocol, Socket, Type};
 use tun::TunSocket;
 
 use dev_lock::{Lock, LockReadGuard};
@@ -156,6 +157,8 @@ pub struct Device {
 
     rate_limiter: Option<Arc<RateLimiter>>,
 
+    // rx: Receiver<NetworkData<'a>>,
+    // tx: Sender<NetworkData<'a>>,
     #[cfg(target_os = "linux")]
     uapi_fd: i32,
 }
@@ -360,6 +363,7 @@ impl Device {
         let uapi_fd = -1;
         #[cfg(target_os = "linux")]
         let uapi_fd = config.uapi_fd;
+        // let (tx, rx) = async_channel::bounded(1024);
 
         let mut device = Device {
             queue: Arc::new(poll),
@@ -379,6 +383,8 @@ impl Device {
             cleanup_paths: Default::default(),
             mtu: AtomicUsize::new(mtu),
             rate_limiter: None,
+            // rx,
+            // tx,
             #[cfg(target_os = "linux")]
             uapi_fd,
         };
@@ -442,9 +448,13 @@ impl Device {
 
         self.register_udp_handler(udp_sock4.try_clone().unwrap())?;
         self.register_udp_handler(udp_sock6.try_clone().unwrap())?;
-        self.udp4 = Some(udp_sock4);
-        self.udp6 = Some(udp_sock6);
-
+        self.udp4 = Some(udp_sock4.try_clone().unwrap());
+        self.udp6 = Some(udp_sock6.try_clone().unwrap());
+        // Send to network in a seperate thread
+        // let rx_clone = self.rx.clone();
+        // let uv4 = Arc::new(udp_sock4).clone();
+        // let uv6 = Arc::new(udp_sock6).clone();
+        // std::thread::spawn(move || send_to_network(rx_clone, uv4, uv6));
         self.listen_port = port;
 
         Ok(())
@@ -831,32 +841,49 @@ impl Device {
                         let mut tun = peer.tunnel.lock();
                         tun.encapsulate(src, &mut t.dst_buf[..])
                     };
-                    match res {
-                        TunnResult::Done => {}
-                        TunnResult::Err(e) => {
-                            tracing::error!(message = "Encapsulate error", error = ?e)
-                        }
-                        TunnResult::WriteToNetwork(packet) => {
-                            let mut endpoint = peer.endpoint_mut();
-                            if let Some(conn) = endpoint.conn.as_mut() {
-                                // Prefer to send using the connected socket
-                                let _: Result<_, _> = conn.write(packet);
-                            } else if let Some(addr @ SocketAddr::V4(_)) = endpoint.addr {
-                                let _: Result<_, _> = udp4.send_to(packet, &addr.into());
-                            } else if let Some(addr @ SocketAddr::V6(_)) = endpoint.addr {
-                                let _: Result<_, _> = udp6.send_to(packet, &addr.into());
-                            } else {
-                                tracing::error!("No endpoint");
-                            }
-                        }
-                        _ => panic!("Unexpected result from encapsulate"),
-                    };
+                    send_to_network(
+                        NetworkData {
+                            res,
+                            peer: peer.clone(),
+                        },
+                        udp4,
+                        udp6,
+                    )
                 }
                 Action::Continue
             }),
         )?;
         Ok(())
     }
+}
+
+struct NetworkData<'a> {
+    peer: Arc<Peer>,
+    res: TunnResult<'a>,
+}
+
+fn send_to_network(msg: NetworkData, udp4: &Socket, udp6: &Socket) {
+    // if let Ok(msg) = rx.recv_blocking() {
+    match msg.res {
+        TunnResult::Done => {}
+        TunnResult::Err(e) => {
+            tracing::error!(message = "Encapsulate error", error = ?e)
+        }
+        TunnResult::WriteToNetwork(packet) => {
+            let mut endpoint = msg.peer.endpoint_mut();
+            if let Some(conn) = endpoint.conn.as_mut() {
+                // Prefer to send using the connected socket
+                let _: Result<_, _> = conn.write(packet);
+            } else if let Some(addr @ SocketAddr::V4(_)) = endpoint.addr {
+                let _: Result<_, _> = udp4.send_to(packet, &addr.into());
+            } else if let Some(addr @ SocketAddr::V6(_)) = endpoint.addr {
+                let _: Result<_, _> = udp6.send_to(packet, &addr.into());
+            } else {
+                tracing::error!("No endpoint");
+            }
+        }
+        _ => panic!("Unexpected result from encapsulate"),
+    };
 }
 
 /// A basic linear-feedback shift register implemented as xorshift, used to

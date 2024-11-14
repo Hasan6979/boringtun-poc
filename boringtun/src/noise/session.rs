@@ -1,7 +1,7 @@
 // Copyright (c) 2019 Cloudflare, Inc. All rights reserved.
 // SPDX-License-Identifier: BSD-3-Clause
 
-use super::{PacketData, TunnResult};
+use super::{NeptunResult, PacketData};
 use crate::{device::peer::Peer, noise::errors::WireGuardError};
 use async_channel::{Receiver, Sender};
 use once_cell::sync::Lazy;
@@ -34,7 +34,7 @@ pub struct EncryptionTaskData {
 }
 const MAX_UDP_SIZE: usize = (1 << 16) - 1;
 
-const RB_SIZE: usize = 50;
+pub const RB_SIZE: usize = 50;
 pub static mut PLAINTEXT_RING_BUFFER: Lazy<VecDeque<Mutex<EncryptionTaskData>>> = Lazy::new(|| {
     let mut deque = VecDeque::with_capacity(RB_SIZE);
     for _ in 0..RB_SIZE {
@@ -55,7 +55,7 @@ pub struct NetworkTaskData<'a> {
     pub data: Box<[u8; MAX_UDP_SIZE]>,
     pub buf_len: usize,
     pub peer: Option<Arc<Peer>>,
-    pub res: TunnResult<'a>,
+    pub res: NeptunResult<'a>,
 }
 
 pub static mut ENCRYPTED_RING_BUFFER: Lazy<VecDeque<Mutex<NetworkTaskData>>> = Lazy::new(|| {
@@ -65,7 +65,7 @@ pub static mut ENCRYPTED_RING_BUFFER: Lazy<VecDeque<Mutex<NetworkTaskData>>> = L
             data: Box::new([0; MAX_UDP_SIZE]),
             buf_len: 0,
             peer: None,
-            res: TunnResult::Done,
+            res: NeptunResult::Done,
         }));
     }
     deque
@@ -92,7 +92,7 @@ const N_WORDS: u64 = 16; // Suffice to reorder 64*16 = 1024 packets; can be incr
 const N_BITS: u64 = WORD_SIZE * N_WORDS;
 
 #[derive(Debug, Clone, Default)]
-struct ReceivingKeyCounterValidator {
+pub struct ReceivingKeyCounterValidator {
     /// In order to avoid replays while allowing for some reordering of the packets, we keep a
     /// bitmap of received packets, and the value of the highest counter
     next: u64,
@@ -253,26 +253,28 @@ impl Session {
         ret
     }
 
-    pub fn encrypt_data_worker(rx: Receiver<()>, tx: Sender<()>) {
-        if rx.recv_blocking().is_ok() {
-            if let Some(plaintext) = unsafe { PLAINTEXT_RING_BUFFER.pop_back() } {
+    pub fn encrypt_data_worker(encrypt_rx: Receiver<usize>, network_tx: Sender<()>) {
+        while let Ok(i) = encrypt_rx.recv_blocking() {
+            if let Some(plaintext) = unsafe { PLAINTEXT_RING_BUFFER.get(i) } {
                 if let Some(encrypted) = unsafe { ENCRYPTED_RING_BUFFER.pop_front() } {
                     {
                         let mut src = plaintext.lock();
                         let mut dst = encrypted.lock();
                         let data_len = src.buf_len;
-                        Session::encrypt_data_pkt(
+                        let (_, data_len) = Session::encrypt_data_pkt(
                             src.sending_key_counter.clone(),
                             src.sending_index,
                             src.sender.as_ref().unwrap().clone(),
                             &src.data.as_mut_slice()[..data_len],
                             dst.data.as_mut_slice(),
                         );
+                        dst.peer = Some(src.peer.as_ref().unwrap().clone());
+                        dst.buf_len = data_len;
+                        dst.res = NeptunResult::WriteToNetwork(data_len);
                     }
                     unsafe { ENCRYPTED_RING_BUFFER.push_back(encrypted) };
                 }
-                unsafe { PLAINTEXT_RING_BUFFER.push_front(plaintext) };
-                let _ = tx.send_blocking(());
+                let _ = network_tx.send_blocking(());
             }
         }
     }
@@ -286,7 +288,7 @@ impl Session {
         sender: Arc<LessSafeKey>,
         src: &[u8],
         dst: &'a mut [u8],
-    ) -> &'a mut [u8] {
+    ) -> (&'a mut [u8], usize) {
         if dst.len() < src.len() + super::DATA_OVERHEAD_SZ {
             panic!("The destination buffer is too small");
         }
@@ -319,14 +321,14 @@ impl Session {
                 .unwrap()
         };
 
-        &mut dst[..DATA_OFFSET + n]
+        (&mut dst[..DATA_OFFSET + n], DATA_OFFSET + n)
     }
 
     /// packet - a data packet we received from the network
     /// dst - pre-allocated space to hold the encapsulated IP packet, to send to the interface
     ///       dst will always take less space than src
     /// return the size of the encapsulated packet on success
-    pub(super) fn decrypt_data_pkt<'a>(
+    pub fn decrypt_data_pkt<'a>(
         packet: PacketData,
         receiving_index: u32,
         receiver: Arc<LessSafeKey>,
@@ -371,9 +373,7 @@ impl Session {
 
 #[cfg(test)]
 mod tests {
-    // use super::*;
-
-    use super::{Session, ENCRYPTED_RING_BUFFER, PLAINTEXT_RING_BUFFER};
+    use super::*;
 
     #[test]
     fn test_encryption_task() {
@@ -404,13 +404,13 @@ mod tests {
             }
             unsafe { PLAINTEXT_RING_BUFFER.push_back(item) };
         }
-        let _ = tx.send_blocking(());
+        let _ = tx.send_blocking(1);
         if rx1.recv_blocking().is_ok() {
             if let Some(recv) = unsafe { ENCRYPTED_RING_BUFFER.pop_back() } {
                 {
                     let en_msg = recv.lock();
                     let src = &en_msg.data[..en_msg.buf_len];
-                    println!("encrypted data {:?}", &en_msg.data[..en_msg.buf_len]);
+                    println!("encrypted data {:?}", src);
                 }
                 unsafe {
                     ENCRYPTED_RING_BUFFER.push_front(recv);
@@ -419,53 +419,53 @@ mod tests {
         }
     }
 
-    // #[test]
-    // fn test_replay_counter() {
-    //     let mut c: ReceivingKeyCounterValidator = Default::default();
+    #[test]
+    fn test_replay_counter() {
+        let mut c: ReceivingKeyCounterValidator = Default::default();
 
-    //     assert!(c.mark_did_receive(0).is_ok());
-    //     assert!(c.mark_did_receive(0).is_err());
-    //     assert!(c.mark_did_receive(1).is_ok());
-    //     assert!(c.mark_did_receive(1).is_err());
-    //     assert!(c.mark_did_receive(63).is_ok());
-    //     assert!(c.mark_did_receive(63).is_err());
-    //     assert!(c.mark_did_receive(15).is_ok());
-    //     assert!(c.mark_did_receive(15).is_err());
+        assert!(c.mark_did_receive(0).is_ok());
+        assert!(c.mark_did_receive(0).is_err());
+        assert!(c.mark_did_receive(1).is_ok());
+        assert!(c.mark_did_receive(1).is_err());
+        assert!(c.mark_did_receive(63).is_ok());
+        assert!(c.mark_did_receive(63).is_err());
+        assert!(c.mark_did_receive(15).is_ok());
+        assert!(c.mark_did_receive(15).is_err());
 
-    //     for i in 64..N_BITS + 128 {
-    //         assert!(c.mark_did_receive(i).is_ok());
-    //         assert!(c.mark_did_receive(i).is_err());
-    //     }
+        for i in 64..N_BITS + 128 {
+            assert!(c.mark_did_receive(i).is_ok());
+            assert!(c.mark_did_receive(i).is_err());
+        }
 
-    //     assert!(c.mark_did_receive(N_BITS * 3).is_ok());
-    //     for i in 0..=N_BITS * 2 {
-    //         assert!(matches!(
-    //             c.will_accept(i),
-    //             Err(WireGuardError::InvalidCounter)
-    //         ));
-    //         assert!(c.mark_did_receive(i).is_err());
-    //     }
-    //     for i in N_BITS * 2 + 1..N_BITS * 3 {
-    //         assert!(c.will_accept(i).is_ok());
-    //     }
-    //     assert!(matches!(
-    //         c.will_accept(N_BITS * 3),
-    //         Err(WireGuardError::DuplicateCounter)
-    //     ));
+        assert!(c.mark_did_receive(N_BITS * 3).is_ok());
+        for i in 0..=N_BITS * 2 {
+            assert!(matches!(
+                c.will_accept(i),
+                Err(WireGuardError::InvalidCounter)
+            ));
+            assert!(c.mark_did_receive(i).is_err());
+        }
+        for i in N_BITS * 2 + 1..N_BITS * 3 {
+            assert!(c.will_accept(i).is_ok());
+        }
+        assert!(matches!(
+            c.will_accept(N_BITS * 3),
+            Err(WireGuardError::DuplicateCounter)
+        ));
 
-    //     for i in (N_BITS * 2 + 1..N_BITS * 3).rev() {
-    //         assert!(c.mark_did_receive(i).is_ok());
-    //         assert!(c.mark_did_receive(i).is_err());
-    //     }
+        for i in (N_BITS * 2 + 1..N_BITS * 3).rev() {
+            assert!(c.mark_did_receive(i).is_ok());
+            assert!(c.mark_did_receive(i).is_err());
+        }
 
-    //     assert!(c.mark_did_receive(N_BITS * 3 + 70).is_ok());
-    //     assert!(c.mark_did_receive(N_BITS * 3 + 71).is_ok());
-    //     assert!(c.mark_did_receive(N_BITS * 3 + 72).is_ok());
-    //     assert!(c.mark_did_receive(N_BITS * 3 + 72 + 125).is_ok());
-    //     assert!(c.mark_did_receive(N_BITS * 3 + 63).is_ok());
+        assert!(c.mark_did_receive(N_BITS * 3 + 70).is_ok());
+        assert!(c.mark_did_receive(N_BITS * 3 + 71).is_ok());
+        assert!(c.mark_did_receive(N_BITS * 3 + 72).is_ok());
+        assert!(c.mark_did_receive(N_BITS * 3 + 72 + 125).is_ok());
+        assert!(c.mark_did_receive(N_BITS * 3 + 63).is_ok());
 
-    //     assert!(c.mark_did_receive(N_BITS * 3 + 70).is_err());
-    //     assert!(c.mark_did_receive(N_BITS * 3 + 71).is_err());
-    //     assert!(c.mark_did_receive(N_BITS * 3 + 72).is_err());
-    // }
+        assert!(c.mark_did_receive(N_BITS * 3 + 70).is_err());
+        assert!(c.mark_did_receive(N_BITS * 3 + 71).is_err());
+        assert!(c.mark_did_receive(N_BITS * 3 + 72).is_err());
+    }
 }

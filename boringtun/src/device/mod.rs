@@ -25,7 +25,7 @@ pub mod tun;
 #[path = "tun_linux.rs"]
 pub mod tun;
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::io::{self, Write as _};
 use std::mem::MaybeUninit;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
@@ -38,20 +38,14 @@ use std::thread::JoinHandle;
 use crate::noise::errors::WireGuardError;
 use crate::noise::handshake::parse_handshake_anon;
 use crate::noise::rate_limiter::RateLimiter;
-use crate::noise::session::{
-    self, EncryptionTaskData, NetworkTaskData, Session, ENCRYPTED_RING_BUFFER,
-    PLAINTEXT_RING_BUFFER,
-};
-use crate::noise::{Packet, Tunn, TunnResult};
+use crate::noise::session::{Session, ENCRYPTED_RING_BUFFER, PLAINTEXT_RING_BUFFER, RB_SIZE};
+use crate::noise::{NeptunResult, Packet, Tunn, TunnResult};
 use crate::x25519;
 use allowed_ips::AllowedIps;
 use async_channel::{Receiver, Sender};
-use once_cell::sync::Lazy;
-use parking_lot::Mutex;
 use peer::{AllowedIP, Peer};
 use poll::{EventPoll, EventRef, WaitResult};
 use rand_core::{OsRng, RngCore};
-use ring::aead::{LessSafeKey, UnboundKey, CHACHA20_POLY1305};
 use socket2::{Domain, Protocol, Socket, Type};
 use tun::TunSocket;
 
@@ -165,11 +159,14 @@ pub struct Device {
 
     rate_limiter: Option<Arc<RateLimiter>>,
 
-    rx: Receiver<()>,
-    tx: Sender<()>,
+    encyrpt_tx: Sender<usize>,
+    network_rx: Receiver<()>,
+    network_tx: Sender<()>,
     #[cfg(target_os = "linux")]
     uapi_fd: i32,
 }
+
+static mut ITER: usize = 0;
 
 struct ThreadData {
     iface: Arc<TunSocket>,
@@ -371,8 +368,8 @@ impl Device {
         let uapi_fd = -1;
         #[cfg(target_os = "linux")]
         let uapi_fd = config.uapi_fd;
-        let (tx, rx) = async_channel::bounded(1024);
-        let (tx1, rx1) = async_channel::bounded(1024);
+        let (encyrpt_tx, encrypt_rx) = async_channel::bounded(1024);
+        let (network_tx, network_rx) = async_channel::bounded(1024);
 
         let mut device = Device {
             queue: Arc::new(poll),
@@ -392,8 +389,9 @@ impl Device {
             cleanup_paths: Default::default(),
             mtu: AtomicUsize::new(mtu),
             rate_limiter: None,
-            rx: rx.clone(),
-            tx: tx.clone(),
+            encyrpt_tx: encyrpt_tx.clone(),
+            network_tx: network_tx.clone(),
+            network_rx,
             #[cfg(target_os = "linux")]
             uapi_fd,
         };
@@ -407,8 +405,8 @@ impl Device {
         device.register_notifiers()?;
         device.register_timers()?;
 
-        let rx_clone = rx.clone();
-        std::thread::spawn(move || Session::encrypt_data_worker(rx_clone, tx1));
+        let rx_clone = encrypt_rx.clone();
+        std::thread::spawn(move || Session::encrypt_data_worker(rx_clone, network_tx));
 
         #[cfg(target_os = "macos")]
         {
@@ -463,10 +461,10 @@ impl Device {
         self.udp4 = Some(udp_sock4.try_clone().unwrap());
         self.udp6 = Some(udp_sock6.try_clone().unwrap());
         // Send to network in a seperate thread
-        let rx_clone = self.rx.clone();
+        let rx_clone = self.network_rx.clone();
         let uv4 = Arc::new(udp_sock4).clone();
         let uv6 = Arc::new(udp_sock6).clone();
-        // std::thread::spawn(move || send_to_network(rx_clone, uv4, uv6));
+        std::thread::spawn(move || send_to_network(rx_clone, uv4, uv6));
         self.listen_port = port;
 
         Ok(())
@@ -823,7 +821,8 @@ impl Device {
 
                 let peers = &d.peers_by_ip;
                 for _ in 0..MAX_ITR {
-                    if let Some(element) = unsafe { PLAINTEXT_RING_BUFFER.pop_front() } {
+                    if let Some(element) = unsafe { PLAINTEXT_RING_BUFFER.get_mut(ITER) } {
+                        let mut is_handshake_msg = false;
                         {
                             let mut item = element.lock();
                             let src = match iface.read(&mut item.data[..mtu]) {
@@ -871,20 +870,39 @@ impl Device {
                                         {
                                             let mut dst = entry.lock();
                                             dst.peer = Some(peer.clone());
-                                            dst.res = tun.format_handshake_initiation(
+                                            let res = tun.format_handshake_initiation(
                                                 dst.data.as_mut_slice(),
-                                                false,
+                                                true,
                                             );
+                                            match res {
+                                                NeptunResult::Done => dst.res = NeptunResult::Done,
+                                                NeptunResult::Err(e) => {
+                                                    dst.res = NeptunResult::Err(e)
+                                                }
+                                                NeptunResult::WriteToNetwork(n) => {
+                                                    dst.res = NeptunResult::WriteToNetwork(n)
+                                                }
+                                                _ => continue,
+                                            }
                                         };
                                         unsafe { ENCRYPTED_RING_BUFFER.push_back(entry) };
-                                        d.tx.send_blocking(()); // change the channel
+                                        let _ = d.network_tx.send_blocking(());
+                                        is_handshake_msg = true;
                                     }
                                 }
                             };
                         }
-                        unsafe { PLAINTEXT_RING_BUFFER.push_back(element) };
+                        // unsafe { PLAINTEXT_RING_BUFFER.push_back(element) };
                         // Notify the encrypt part with channel!!
-                        d.tx.send_blocking(());
+                        if !is_handshake_msg {
+                            let _ = d.encyrpt_tx.send_blocking(unsafe { ITER });
+                            if unsafe { ITER != (RB_SIZE - 1) } {
+                                unsafe { ITER += 1 };
+                            } else {
+                                // Reset the write iterator
+                                unsafe { ITER = 0 };
+                            }
+                        }
                         continue;
                         // TODO: Q the packet
                     }
@@ -896,30 +914,36 @@ impl Device {
     }
 }
 
-fn send_to_network(rx: Receiver<()>, udp4: Arc<Socket>, udp6: Arc<Socket>) {
-    if rx.recv_blocking().is_ok() {
-        if let Some(msg) = unsafe { ENCRYPTED_RING_BUFFER.pop_back() } {
-            let msg = msg.lock();
-            match &msg.res {
-                TunnResult::Done => {}
-                TunnResult::Err(e) => {
-                    tracing::error!(message = "Encapsulate error", error = ?e)
-                }
-                TunnResult::WriteToNetwork(packet) => {
-                    let mut endpoint = msg.peer.as_ref().unwrap().endpoint_mut();
-                    if let Some(conn) = endpoint.conn.as_mut() {
-                        // Prefer to send using the connected socket
-                        let _: Result<_, _> = conn.write(packet);
-                    } else if let Some(addr @ SocketAddr::V4(_)) = endpoint.addr {
-                        let _: Result<_, _> = udp4.send_to(packet, &addr.into());
-                    } else if let Some(addr @ SocketAddr::V6(_)) = endpoint.addr {
-                        let _: Result<_, _> = udp6.send_to(packet, &addr.into());
-                    } else {
-                        tracing::error!("No endpoint");
+fn send_to_network(network_rx: Receiver<()>, udp4: Arc<Socket>, udp6: Arc<Socket>) {
+    while network_rx.recv_blocking().is_ok() {
+        if let Some(elem) = unsafe { ENCRYPTED_RING_BUFFER.pop_back() } {
+            {
+                let msg = elem.lock();
+                match &msg.res {
+                    NeptunResult::Done => {}
+                    NeptunResult::Err(e) => {
+                        tracing::error!(message = "Encapsulate error", error = ?e)
                     }
-                }
-                _ => panic!("Unexpected result from encapsulate"),
-            };
+                    NeptunResult::WriteToNetwork(len) => {
+                        let mut endpoint = msg.peer.as_ref().unwrap().endpoint_mut();
+                        let packet = &msg.data.as_slice()[..(*len)];
+                        if let Some(conn) = endpoint.conn.as_mut() {
+                            // Prefer to send using the connected socket
+                            let _: Result<_, _> = conn.write(packet);
+                        } else if let Some(addr @ SocketAddr::V4(_)) = endpoint.addr {
+                            let _: Result<_, _> = udp4.send_to(packet, &addr.into());
+                        } else if let Some(addr @ SocketAddr::V6(_)) = endpoint.addr {
+                            let _: Result<_, _> = udp6.send_to(packet, &addr.into());
+                        } else {
+                            tracing::error!("No endpoint");
+                        }
+                    }
+                    _ => panic!("Unexpected result from encapsulate"),
+                };
+            }
+            unsafe {
+                ENCRYPTED_RING_BUFFER.push_front(elem);
+            }
         }
     }
 }

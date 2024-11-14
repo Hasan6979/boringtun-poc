@@ -6,12 +6,9 @@ pub mod handshake;
 pub mod rate_limiter;
 
 pub mod session;
-mod timers;
+pub mod timers;
 
-use once_cell::sync::Lazy;
-use parking_lot::Mutex;
-use ring::aead::{LessSafeKey, UnboundKey, CHACHA20_POLY1305};
-use session::{Session, PLAINTEXT_RING_BUFFER};
+use session::Session;
 
 use crate::noise::errors::WireGuardError;
 use crate::noise::handshake::Handshake;
@@ -22,7 +19,6 @@ use crate::x25519;
 use std::collections::VecDeque;
 use std::convert::{TryFrom, TryInto};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -51,14 +47,29 @@ const N_SESSIONS: usize = 8;
 pub enum TunnResult<'a> {
     Done,
     Err(WireGuardError),
-    WriteToNetwork(&'a [u8]),
-    WriteToTunnelV4(&'a [u8], Ipv4Addr),
-    WriteToTunnelV6(&'a [u8], Ipv6Addr),
+    WriteToNetwork(&'a mut [u8]),
+    WriteToTunnelV4(&'a mut [u8], Ipv4Addr),
+    WriteToTunnelV6(&'a mut [u8], Ipv6Addr),
 }
 
 impl<'a> From<WireGuardError> for TunnResult<'a> {
     fn from(err: WireGuardError) -> TunnResult<'a> {
         TunnResult::Err(err)
+    }
+}
+
+#[derive(Debug)]
+pub enum NeptunResult<'a> {
+    Done,
+    Err(WireGuardError),
+    WriteToNetwork(usize),
+    WriteToTunnelV4(&'a mut [u8], Ipv4Addr),
+    WriteToTunnelV6(&'a mut [u8], Ipv6Addr),
+}
+
+impl<'a> From<WireGuardError> for NeptunResult<'a> {
+    fn from(err: WireGuardError) -> NeptunResult<'a> {
+        NeptunResult::Err(err)
     }
 }
 
@@ -74,7 +85,7 @@ pub struct Tunn {
     packet_queue: VecDeque<Vec<u8>>,
     /// Keeps tabs on the expiring timers
     timers: timers::Timers,
-    tx_bytes: usize,
+    pub tx_bytes: usize,
     rx_bytes: usize,
     rate_limiter: Arc<RateLimiter>,
 }
@@ -367,7 +378,7 @@ impl Tunn {
 
         let session = self.handshake.receive_handshake_response(p)?;
 
-        let keepalive_packet = {
+        let (keepalive_packet, _) = {
             Session::encrypt_data_pkt(
                 session.sending_key_counter.clone(),
                 session.sending_index,
@@ -425,11 +436,11 @@ impl Tunn {
     }
 
     /// Decrypts a data packet, and stores the decapsulated packet in dst.
-    fn handle_data(
+    fn handle_data<'a>(
         &mut self,
         packet: PacketData,
-        dst: &mut [u8],
-    ) -> Result<TunnResult, WireGuardError> {
+        dst: &'a mut [u8],
+    ) -> Result<TunnResult<'a>, WireGuardError> {
         let r_idx = packet.receiver_idx as usize;
         let idx = r_idx % N_SESSIONS;
 
@@ -462,9 +473,9 @@ impl Tunn {
         &mut self,
         dst: &'a mut [u8],
         force_resend: bool,
-    ) -> TunnResult<'a> {
+    ) -> NeptunResult {
         if self.handshake.is_in_progress() && !force_resend {
-            return TunnResult::Done;
+            return NeptunResult::Done;
         }
 
         if self.handshake.is_expired() {
@@ -481,9 +492,9 @@ impl Tunn {
                     self.timer_tick(TimerName::TimeLastHandshakeStarted);
                 }
                 self.timer_tick(TimerName::TimeLastPacketSent);
-                TunnResult::WriteToNetwork(packet)
+                NeptunResult::WriteToNetwork(packet.len())
             }
-            Err(e) => TunnResult::Err(e),
+            Err(e) => NeptunResult::Err(e),
         }
     }
 
@@ -642,8 +653,8 @@ impl Tunn {
 //     fn create_handshake_init(tun: &mut Tunn) -> Vec<u8> {
 //         let mut dst = vec![0u8; 2048];
 //         let handshake_init = tun.format_handshake_initiation(&mut dst, false);
-//         assert!(matches!(handshake_init, TunnResult::WriteToNetwork(_)));
-//         let handshake_init = if let TunnResult::WriteToNetwork(sent) = handshake_init {
+//         assert!(matches!(handshake_init, NeptunResult::WriteToNetwork(_)));
+//         let handshake_init = if let NeptunResult::WriteToNetwork(sent) = handshake_init {
 //             sent
 //         } else {
 //             unreachable!();

@@ -25,7 +25,7 @@ pub mod tun;
 #[path = "tun_linux.rs"]
 pub mod tun;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io::{self, Write as _};
 use std::mem::MaybeUninit;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
@@ -38,13 +38,20 @@ use std::thread::JoinHandle;
 use crate::noise::errors::WireGuardError;
 use crate::noise::handshake::parse_handshake_anon;
 use crate::noise::rate_limiter::RateLimiter;
+use crate::noise::session::{
+    self, EncryptionTaskData, NetworkTaskData, Session, ENCRYPTED_RING_BUFFER,
+    PLAINTEXT_RING_BUFFER,
+};
 use crate::noise::{Packet, Tunn, TunnResult};
 use crate::x25519;
 use allowed_ips::AllowedIps;
 use async_channel::{Receiver, Sender};
+use once_cell::sync::Lazy;
+use parking_lot::Mutex;
 use peer::{AllowedIP, Peer};
 use poll::{EventPoll, EventRef, WaitResult};
 use rand_core::{OsRng, RngCore};
+use ring::aead::{LessSafeKey, UnboundKey, CHACHA20_POLY1305};
 use socket2::{Domain, Protocol, Socket, Type};
 use tun::TunSocket;
 
@@ -55,6 +62,7 @@ const HANDSHAKE_RATE_LIMIT: u64 = 100; // The number of handshakes per second we
 const MAX_UDP_SIZE: usize = (1 << 16) - 1;
 const MAX_ITR: usize = 100; // Number of packets to handle per handler call
 const WG_PORT: u16 = 53115;
+const N_SESSIONS: usize = 8;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -157,8 +165,8 @@ pub struct Device {
 
     rate_limiter: Option<Arc<RateLimiter>>,
 
-    // rx: Receiver<NetworkData<'a>>,
-    // tx: Sender<NetworkData<'a>>,
+    rx: Receiver<()>,
+    tx: Sender<()>,
     #[cfg(target_os = "linux")]
     uapi_fd: i32,
 }
@@ -363,7 +371,8 @@ impl Device {
         let uapi_fd = -1;
         #[cfg(target_os = "linux")]
         let uapi_fd = config.uapi_fd;
-        // let (tx, rx) = async_channel::bounded(1024);
+        let (tx, rx) = async_channel::bounded(1024);
+        let (tx1, rx1) = async_channel::bounded(1024);
 
         let mut device = Device {
             queue: Arc::new(poll),
@@ -383,8 +392,8 @@ impl Device {
             cleanup_paths: Default::default(),
             mtu: AtomicUsize::new(mtu),
             rate_limiter: None,
-            // rx,
-            // tx,
+            rx: rx.clone(),
+            tx: tx.clone(),
             #[cfg(target_os = "linux")]
             uapi_fd,
         };
@@ -397,6 +406,9 @@ impl Device {
         device.register_iface_handler(Arc::clone(&device.iface))?;
         device.register_notifiers()?;
         device.register_timers()?;
+
+        let rx_clone = rx.clone();
+        std::thread::spawn(move || Session::encrypt_data_worker(rx_clone, tx1));
 
         #[cfg(target_os = "macos")]
         {
@@ -451,9 +463,9 @@ impl Device {
         self.udp4 = Some(udp_sock4.try_clone().unwrap());
         self.udp6 = Some(udp_sock6.try_clone().unwrap());
         // Send to network in a seperate thread
-        // let rx_clone = self.rx.clone();
-        // let uv4 = Arc::new(udp_sock4).clone();
-        // let uv6 = Arc::new(udp_sock6).clone();
+        let rx_clone = self.rx.clone();
+        let uv4 = Arc::new(udp_sock4).clone();
+        let uv6 = Arc::new(udp_sock6).clone();
         // std::thread::spawn(move || send_to_network(rx_clone, uv4, uv6));
         self.listen_port = port;
 
@@ -811,44 +823,71 @@ impl Device {
 
                 let peers = &d.peers_by_ip;
                 for _ in 0..MAX_ITR {
-                    let src = match iface.read(&mut t.src_buf[..mtu]) {
-                        Ok(src) => src,
-                        Err(Error::IfaceRead(e)) => {
-                            let ek = e.kind();
-                            if ek == io::ErrorKind::Interrupted || ek == io::ErrorKind::WouldBlock {
-                                break;
-                            }
-                            eprintln!("Fatal read error on tun interface: {:?}", e);
-                            return Action::Exit;
+                    if let Some(element) = unsafe { PLAINTEXT_RING_BUFFER.pop_front() } {
+                        {
+                            let mut item = element.lock();
+                            let src = match iface.read(&mut item.data[..mtu]) {
+                                Ok(src) => src,
+                                Err(Error::IfaceRead(e)) => {
+                                    let ek = e.kind();
+                                    if ek == io::ErrorKind::Interrupted
+                                        || ek == io::ErrorKind::WouldBlock
+                                    {
+                                        break;
+                                    }
+                                    eprintln!("Fatal read error on tun interface: {:?}", e);
+                                    return Action::Exit;
+                                }
+                                Err(e) => {
+                                    eprintln!("Unexpected error on tun interface: {:?}", e);
+                                    return Action::Exit;
+                                }
+                            };
+
+                            let dst_addr = match Tunn::dst_address(src) {
+                                Some(addr) => addr,
+                                None => continue,
+                            };
+
+                            let peer = match peers.find(dst_addr) {
+                                Some(peer) => peer,
+                                None => continue,
+                            };
+                            {
+                                let mut tun = peer.tunnel.lock();
+                                let current = tun.current;
+                                if let Some(ref session) = tun.sessions[current % N_SESSIONS] {
+                                    // Send the packet using an established session
+                                    item.buf_len = src.len();
+                                    item.sending_index = session.sending_index;
+                                    item.sender = Some(session.sender.clone());
+                                    item.sending_key_counter = session.sending_key_counter.clone();
+                                    item.peer = Some(peer.clone());
+                                } else {
+                                    // Initiate handshake
+                                    if let Some(entry) =
+                                        unsafe { ENCRYPTED_RING_BUFFER.pop_front() }
+                                    {
+                                        {
+                                            let mut dst = entry.lock();
+                                            dst.peer = Some(peer.clone());
+                                            let res = tun.format_handshake_initiation(
+                                                dst.data.as_mut_slice(),
+                                                false,
+                                            );
+                                        };
+                                        unsafe { ENCRYPTED_RING_BUFFER.push_back(entry) };
+                                        d.tx.send_blocking(()); // change the channel
+                                    }
+                                }
+                            };
                         }
-                        Err(e) => {
-                            eprintln!("Unexpected error on tun interface: {:?}", e);
-                            return Action::Exit;
-                        }
-                    };
-
-                    let dst_addr = match Tunn::dst_address(src) {
-                        Some(addr) => addr,
-                        None => continue,
-                    };
-
-                    let peer = match peers.find(dst_addr) {
-                        Some(peer) => peer,
-                        None => continue,
-                    };
-
-                    let res = {
-                        let mut tun = peer.tunnel.lock();
-                        tun.encapsulate(src, &mut t.dst_buf[..])
-                    };
-                    send_to_network(
-                        NetworkData {
-                            res,
-                            peer: peer.clone(),
-                        },
-                        udp4,
-                        udp6,
-                    )
+                        unsafe { PLAINTEXT_RING_BUFFER.push_back(element) };
+                        // Notify the encrypt part with channel!!
+                        d.tx.send_blocking(());
+                        continue;
+                        // TODO: Q the packet
+                    }
                 }
                 Action::Continue
             }),
@@ -857,33 +896,32 @@ impl Device {
     }
 }
 
-struct NetworkData<'a> {
-    peer: Arc<Peer>,
-    res: TunnResult<'a>,
-}
-
-fn send_to_network(msg: NetworkData, udp4: &Socket, udp6: &Socket) {
-    // if let Ok(msg) = rx.recv_blocking() {
-    match msg.res {
-        TunnResult::Done => {}
-        TunnResult::Err(e) => {
-            tracing::error!(message = "Encapsulate error", error = ?e)
+fn send_to_network(rx: Receiver<()>, udp4: Arc<Socket>, udp6: Arc<Socket>) {
+    if rx.recv_blocking().is_ok() {
+        if let Some(msg) = unsafe { ENCRYPTED_RING_BUFFER.pop_back() } {
+            let msg = msg.lock();
+            match &msg.res {
+                TunnResult::Done => {}
+                TunnResult::Err(e) => {
+                    tracing::error!(message = "Encapsulate error", error = ?e)
+                }
+                TunnResult::WriteToNetwork(packet) => {
+                    let mut endpoint = msg.peer.as_ref().unwrap().endpoint_mut();
+                    if let Some(conn) = endpoint.conn.as_mut() {
+                        // Prefer to send using the connected socket
+                        let _: Result<_, _> = conn.write(packet);
+                    } else if let Some(addr @ SocketAddr::V4(_)) = endpoint.addr {
+                        let _: Result<_, _> = udp4.send_to(packet, &addr.into());
+                    } else if let Some(addr @ SocketAddr::V6(_)) = endpoint.addr {
+                        let _: Result<_, _> = udp6.send_to(packet, &addr.into());
+                    } else {
+                        tracing::error!("No endpoint");
+                    }
+                }
+                _ => panic!("Unexpected result from encapsulate"),
+            };
         }
-        TunnResult::WriteToNetwork(packet) => {
-            let mut endpoint = msg.peer.endpoint_mut();
-            if let Some(conn) = endpoint.conn.as_mut() {
-                // Prefer to send using the connected socket
-                let _: Result<_, _> = conn.write(packet);
-            } else if let Some(addr @ SocketAddr::V4(_)) = endpoint.addr {
-                let _: Result<_, _> = udp4.send_to(packet, &addr.into());
-            } else if let Some(addr @ SocketAddr::V6(_)) = endpoint.addr {
-                let _: Result<_, _> = udp6.send_to(packet, &addr.into());
-            } else {
-                tracing::error!("No endpoint");
-            }
-        }
-        _ => panic!("Unexpected result from encapsulate"),
-    };
+    }
 }
 
 /// A basic linear-feedback shift register implemented as xorshift, used to

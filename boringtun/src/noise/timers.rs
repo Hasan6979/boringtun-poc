@@ -300,13 +300,13 @@ impl Tunn {
             }
         }
 
-        if handshake_initiation_required {
-            return self.format_handshake_initiation(dst, true);
-        }
+        // if handshake_initiation_required {
+        //     return self.format_handshake_initiation(dst, true);
+        // }
 
-        if keepalive_required {
-            return self.encapsulate(&[], dst);
-        }
+        // if keepalive_required {
+        //     return self.encapsulate(&[], dst);
+        // }
 
         TunnResult::Done
     }

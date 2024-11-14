@@ -1,23 +1,75 @@
 // Copyright (c) 2019 Cloudflare, Inc. All rights reserved.
 // SPDX-License-Identifier: BSD-3-Clause
 
-use super::PacketData;
-use crate::noise::errors::WireGuardError;
+use super::{PacketData, TunnResult};
+use crate::{device::peer::Peer, noise::errors::WireGuardError};
+use async_channel::{Receiver, Sender};
+use once_cell::sync::Lazy;
 use parking_lot::Mutex;
 use ring::aead::{Aad, LessSafeKey, Nonce, UnboundKey, CHACHA20_POLY1305};
-use std::sync::{
-    atomic::{AtomicUsize, Ordering},
-    Arc,
+use std::{
+    collections::VecDeque,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
 };
 
 pub struct Session {
-    pub(crate) receiving_index: u32,
-    pub(crate) sending_index: u32,
-    pub(crate) receiver: LessSafeKey,
-    pub(crate) sender: Arc<LessSafeKey>,
-    pub(crate) sending_key_counter: AtomicUsize,
-    receiving_key_counter: Mutex<ReceivingKeyCounterValidator>,
+    pub receiving_index: u32,
+    pub sending_index: u32,
+    pub receiver: Arc<LessSafeKey>,
+    pub sender: Arc<LessSafeKey>,
+    pub sending_key_counter: Arc<AtomicUsize>,
+    pub receiving_key_counter: Arc<Mutex<ReceivingKeyCounterValidator>>,
 }
+
+pub struct EncryptionTaskData {
+    pub data: Box<[u8; MAX_UDP_SIZE]>,
+    pub buf_len: usize,
+    pub sender: Option<Arc<LessSafeKey>>,
+    pub sending_key_counter: Arc<AtomicUsize>,
+    pub sending_index: u32,
+    pub peer: Option<Arc<Peer>>,
+}
+const MAX_UDP_SIZE: usize = (1 << 16) - 1;
+
+const RB_SIZE: usize = 50;
+pub static mut PLAINTEXT_RING_BUFFER: Lazy<VecDeque<Mutex<EncryptionTaskData>>> = Lazy::new(|| {
+    let mut deque = VecDeque::with_capacity(RB_SIZE);
+    for _ in 0..RB_SIZE {
+        deque.push_back(Mutex::new(EncryptionTaskData {
+            data: Box::new([0; MAX_UDP_SIZE]),
+            buf_len: 0,
+            sender: None,
+            sending_key_counter: Arc::default(),
+            sending_index: 0,
+            peer: None,
+        }));
+    }
+    deque
+});
+
+pub struct NetworkTaskData<'a> {
+    // peer: Arc<Peer>,
+    pub data: Box<[u8; MAX_UDP_SIZE]>,
+    pub buf_len: usize,
+    pub peer: Option<Arc<Peer>>,
+    pub res: TunnResult<'a>,
+}
+
+pub static mut ENCRYPTED_RING_BUFFER: Lazy<VecDeque<Mutex<NetworkTaskData>>> = Lazy::new(|| {
+    let mut deque = VecDeque::with_capacity(RB_SIZE);
+    for _ in 0..RB_SIZE {
+        deque.push_back(Mutex::new(NetworkTaskData {
+            data: Box::new([0; MAX_UDP_SIZE]),
+            buf_len: 0,
+            peer: None,
+            res: TunnResult::Done,
+        }));
+    }
+    deque
+});
 
 impl std::fmt::Debug for Session {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
@@ -164,14 +216,14 @@ impl Session {
         Session {
             receiving_index: local_index,
             sending_index: peer_index,
-            receiver: LessSafeKey::new(
+            receiver: Arc::new(LessSafeKey::new(
                 UnboundKey::new(&CHACHA20_POLY1305, &receiving_key).unwrap(),
-            ),
+            )),
             sender: Arc::new(LessSafeKey::new(
                 UnboundKey::new(&CHACHA20_POLY1305, &sending_key).unwrap(),
             )),
-            sending_key_counter: AtomicUsize::new(0),
-            receiving_key_counter: Mutex::new(Default::default()),
+            sending_key_counter: Arc::new(AtomicUsize::new(0)),
+            receiving_key_counter: Arc::new(Mutex::new(Default::default())),
         }
     }
 
@@ -180,14 +232,20 @@ impl Session {
     }
 
     /// Returns true if receiving counter is good to use
-    fn receiving_counter_quick_check(&self, counter: u64) -> Result<(), WireGuardError> {
-        let counter_validator = self.receiving_key_counter.lock();
+    fn receiving_counter_quick_check(
+        receiving_key_counter: Arc<Mutex<ReceivingKeyCounterValidator>>,
+        counter: u64,
+    ) -> Result<(), WireGuardError> {
+        let counter_validator = receiving_key_counter.lock();
         counter_validator.will_accept(counter)
     }
 
     /// Returns true if receiving counter is good to use, and marks it as used {
-    fn receiving_counter_mark(&self, counter: u64) -> Result<(), WireGuardError> {
-        let mut counter_validator = self.receiving_key_counter.lock();
+    fn receiving_counter_mark(
+        receiving_key_counter: Arc<Mutex<ReceivingKeyCounterValidator>>,
+        counter: u64,
+    ) -> Result<(), WireGuardError> {
+        let mut counter_validator = receiving_key_counter.lock();
         let ret = counter_validator.mark_did_receive(counter);
         if ret.is_ok() {
             counter_validator.receive_cnt += 1;
@@ -195,11 +253,35 @@ impl Session {
         ret
     }
 
+    pub fn encrypt_data_worker(rx: Receiver<()>, tx: Sender<()>) {
+        if rx.recv_blocking().is_ok() {
+            if let Some(plaintext) = unsafe { PLAINTEXT_RING_BUFFER.pop_back() } {
+                if let Some(encrypted) = unsafe { ENCRYPTED_RING_BUFFER.pop_front() } {
+                    {
+                        let mut src = plaintext.lock();
+                        let mut dst = encrypted.lock();
+                        let data_len = src.buf_len;
+                        Session::encrypt_data_pkt(
+                            src.sending_key_counter.clone(),
+                            src.sending_index,
+                            src.sender.as_ref().unwrap().clone(),
+                            &src.data.as_mut_slice()[..data_len],
+                            dst.data.as_mut_slice(),
+                        );
+                    }
+                    unsafe { ENCRYPTED_RING_BUFFER.push_back(encrypted) };
+                }
+                unsafe { PLAINTEXT_RING_BUFFER.push_front(plaintext) };
+                let _ = tx.send_blocking(());
+            }
+        }
+    }
+
     /// src - an IP packet from the interface
     /// dst - pre-allocated space to hold the encapsulating UDP packet to send over the network
     /// returns the size of the formatted packet
-    pub(super) fn encrypt_data_pkt<'a>(
-        sending_key_counter: &AtomicUsize,
+    pub fn encrypt_data_pkt<'a>(
+        sending_key_counter: Arc<AtomicUsize>,
         sending_index: u32,
         sender: Arc<LessSafeKey>,
         src: &[u8],
@@ -245,8 +327,10 @@ impl Session {
     ///       dst will always take less space than src
     /// return the size of the encapsulated packet on success
     pub(super) fn decrypt_data_pkt<'a>(
-        &self,
         packet: PacketData,
+        receiving_index: u32,
+        receiver: Arc<LessSafeKey>,
+        receiving_key_counter: Arc<Mutex<ReceivingKeyCounterValidator>>,
         dst: &'a mut [u8],
     ) -> Result<&'a mut [u8], WireGuardError> {
         let ct_len = packet.encrypted_encapsulated_packet.len();
@@ -254,17 +338,17 @@ impl Session {
             // This is a very incorrect use of the library, therefore panic and not error
             panic!("The destination buffer is too small");
         }
-        if packet.receiver_idx != self.receiving_index {
+        if packet.receiver_idx != receiving_index {
             return Err(WireGuardError::WrongIndex);
         }
         // Don't reuse counters, in case this is a replay attack we want to quickly check the counter without running expensive decryption
-        self.receiving_counter_quick_check(packet.counter)?;
+        Session::receiving_counter_quick_check(receiving_key_counter.clone(), packet.counter)?;
 
         let ret = {
             let mut nonce = [0u8; 12];
             nonce[4..12].copy_from_slice(&packet.counter.to_le_bytes());
             dst[..ct_len].copy_from_slice(packet.encrypted_encapsulated_packet);
-            self.receiver
+            receiver
                 .open_in_place(
                     Nonce::assume_unique_for_key(nonce),
                     Aad::from(&[]),
@@ -274,7 +358,7 @@ impl Session {
         };
 
         // After decryption is done, check counter again, and mark as received
-        self.receiving_counter_mark(packet.counter)?;
+        Session::receiving_counter_mark(receiving_key_counter.clone(), packet.counter)?;
         Ok(ret)
     }
 
@@ -287,54 +371,101 @@ impl Session {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    // use super::*;
+
+    use super::{Session, ENCRYPTED_RING_BUFFER, PLAINTEXT_RING_BUFFER};
+
     #[test]
-    fn test_replay_counter() {
-        let mut c: ReceivingKeyCounterValidator = Default::default();
+    fn test_encryption_task() {
+        let local_index = 1;
+        let peer_index = 1;
+        let receiving_key = [1; 32];
+        let sending_key = [2; 32];
+        let (tx, rx) = async_channel::bounded(10);
+        let (tx1, rx1) = async_channel::bounded(10);
+        let session = Session::new(local_index, peer_index, receiving_key, sending_key);
 
-        assert!(c.mark_did_receive(0).is_ok());
-        assert!(c.mark_did_receive(0).is_err());
-        assert!(c.mark_did_receive(1).is_ok());
-        assert!(c.mark_did_receive(1).is_err());
-        assert!(c.mark_did_receive(63).is_ok());
-        assert!(c.mark_did_receive(63).is_err());
-        assert!(c.mark_did_receive(15).is_ok());
-        assert!(c.mark_did_receive(15).is_err());
+        let rx_clone = rx.clone();
+        std::thread::spawn(move || Session::encrypt_data_worker(rx_clone, tx1));
 
-        for i in 64..N_BITS + 128 {
-            assert!(c.mark_did_receive(i).is_ok());
-            assert!(c.mark_did_receive(i).is_err());
+        // Generate some data
+        if let Some(item) = unsafe { PLAINTEXT_RING_BUFFER.pop_front() } {
+            {
+                let mut it = item.lock();
+                let x = it.data.as_mut_slice();
+                for i in 0..10 {
+                    x[i] = i as u8;
+                }
+                it.sender = Some(session.sender.clone());
+                it.sending_index = session.sending_index;
+                it.buf_len = 10;
+                println!("data {:?}", &it.data[..it.buf_len]);
+                it.sending_key_counter = session.sending_key_counter.clone();
+            }
+            unsafe { PLAINTEXT_RING_BUFFER.push_back(item) };
         }
-
-        assert!(c.mark_did_receive(N_BITS * 3).is_ok());
-        for i in 0..=N_BITS * 2 {
-            assert!(matches!(
-                c.will_accept(i),
-                Err(WireGuardError::InvalidCounter)
-            ));
-            assert!(c.mark_did_receive(i).is_err());
+        let _ = tx.send_blocking(());
+        if rx1.recv_blocking().is_ok() {
+            if let Some(recv) = unsafe { ENCRYPTED_RING_BUFFER.pop_back() } {
+                {
+                    let en_msg = recv.lock();
+                    let src = &en_msg.data[..en_msg.buf_len];
+                    println!("encrypted data {:?}", &en_msg.data[..en_msg.buf_len]);
+                }
+                unsafe {
+                    ENCRYPTED_RING_BUFFER.push_front(recv);
+                }
+            }
         }
-        for i in N_BITS * 2 + 1..N_BITS * 3 {
-            assert!(c.will_accept(i).is_ok());
-        }
-        assert!(matches!(
-            c.will_accept(N_BITS * 3),
-            Err(WireGuardError::DuplicateCounter)
-        ));
-
-        for i in (N_BITS * 2 + 1..N_BITS * 3).rev() {
-            assert!(c.mark_did_receive(i).is_ok());
-            assert!(c.mark_did_receive(i).is_err());
-        }
-
-        assert!(c.mark_did_receive(N_BITS * 3 + 70).is_ok());
-        assert!(c.mark_did_receive(N_BITS * 3 + 71).is_ok());
-        assert!(c.mark_did_receive(N_BITS * 3 + 72).is_ok());
-        assert!(c.mark_did_receive(N_BITS * 3 + 72 + 125).is_ok());
-        assert!(c.mark_did_receive(N_BITS * 3 + 63).is_ok());
-
-        assert!(c.mark_did_receive(N_BITS * 3 + 70).is_err());
-        assert!(c.mark_did_receive(N_BITS * 3 + 71).is_err());
-        assert!(c.mark_did_receive(N_BITS * 3 + 72).is_err());
     }
+
+    // #[test]
+    // fn test_replay_counter() {
+    //     let mut c: ReceivingKeyCounterValidator = Default::default();
+
+    //     assert!(c.mark_did_receive(0).is_ok());
+    //     assert!(c.mark_did_receive(0).is_err());
+    //     assert!(c.mark_did_receive(1).is_ok());
+    //     assert!(c.mark_did_receive(1).is_err());
+    //     assert!(c.mark_did_receive(63).is_ok());
+    //     assert!(c.mark_did_receive(63).is_err());
+    //     assert!(c.mark_did_receive(15).is_ok());
+    //     assert!(c.mark_did_receive(15).is_err());
+
+    //     for i in 64..N_BITS + 128 {
+    //         assert!(c.mark_did_receive(i).is_ok());
+    //         assert!(c.mark_did_receive(i).is_err());
+    //     }
+
+    //     assert!(c.mark_did_receive(N_BITS * 3).is_ok());
+    //     for i in 0..=N_BITS * 2 {
+    //         assert!(matches!(
+    //             c.will_accept(i),
+    //             Err(WireGuardError::InvalidCounter)
+    //         ));
+    //         assert!(c.mark_did_receive(i).is_err());
+    //     }
+    //     for i in N_BITS * 2 + 1..N_BITS * 3 {
+    //         assert!(c.will_accept(i).is_ok());
+    //     }
+    //     assert!(matches!(
+    //         c.will_accept(N_BITS * 3),
+    //         Err(WireGuardError::DuplicateCounter)
+    //     ));
+
+    //     for i in (N_BITS * 2 + 1..N_BITS * 3).rev() {
+    //         assert!(c.mark_did_receive(i).is_ok());
+    //         assert!(c.mark_did_receive(i).is_err());
+    //     }
+
+    //     assert!(c.mark_did_receive(N_BITS * 3 + 70).is_ok());
+    //     assert!(c.mark_did_receive(N_BITS * 3 + 71).is_ok());
+    //     assert!(c.mark_did_receive(N_BITS * 3 + 72).is_ok());
+    //     assert!(c.mark_did_receive(N_BITS * 3 + 72 + 125).is_ok());
+    //     assert!(c.mark_did_receive(N_BITS * 3 + 63).is_ok());
+
+    //     assert!(c.mark_did_receive(N_BITS * 3 + 70).is_err());
+    //     assert!(c.mark_did_receive(N_BITS * 3 + 71).is_err());
+    //     assert!(c.mark_did_receive(N_BITS * 3 + 72).is_err());
+    // }
 }

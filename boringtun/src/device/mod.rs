@@ -871,7 +871,7 @@ impl Device {
                                         {
                                             let mut dst = entry.lock();
                                             dst.peer = Some(peer.clone());
-                                            let res = tun.format_handshake_initiation(
+                                            dst.res = tun.format_handshake_initiation(
                                                 dst.data.as_mut_slice(),
                                                 false,
                                             );

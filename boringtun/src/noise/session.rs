@@ -1,18 +1,17 @@
 // Copyright (c) 2019 Cloudflare, Inc. All rights reserved.
 // SPDX-License-Identifier: BSD-3-Clause
 
-use super::{NeptunResult, PacketData};
-use crate::{device::peer::Peer, noise::errors::WireGuardError};
+use super::{
+    ring_buffers::{ENCRYPTED_RING_BUFFER, PLAINTEXT_RING_BUFFER},
+    NeptunResult, PacketData,
+};
+use crate::noise::errors::WireGuardError;
 use async_channel::{Receiver, Sender};
-use once_cell::sync::Lazy;
 use parking_lot::Mutex;
 use ring::aead::{Aad, LessSafeKey, Nonce, UnboundKey, CHACHA20_POLY1305};
-use std::{
-    collections::VecDeque,
-    sync::{
-        atomic::{AtomicUsize, Ordering},
-        Arc,
-    },
+use std::sync::{
+    atomic::{AtomicUsize, Ordering},
+    Arc,
 };
 
 pub struct Session {
@@ -23,53 +22,6 @@ pub struct Session {
     pub sending_key_counter: Arc<AtomicUsize>,
     pub receiving_key_counter: Arc<Mutex<ReceivingKeyCounterValidator>>,
 }
-
-pub struct EncryptionTaskData {
-    pub data: Box<[u8; MAX_UDP_SIZE]>,
-    pub buf_len: usize,
-    pub sender: Option<Arc<LessSafeKey>>,
-    pub sending_key_counter: Arc<AtomicUsize>,
-    pub sending_index: u32,
-    pub peer: Option<Arc<Peer>>,
-}
-const MAX_UDP_SIZE: usize = (1 << 16) - 1;
-
-pub const RB_SIZE: usize = 50;
-pub static mut PLAINTEXT_RING_BUFFER: Lazy<VecDeque<Mutex<EncryptionTaskData>>> = Lazy::new(|| {
-    let mut deque = VecDeque::with_capacity(RB_SIZE);
-    for _ in 0..RB_SIZE {
-        deque.push_back(Mutex::new(EncryptionTaskData {
-            data: Box::new([0; MAX_UDP_SIZE]),
-            buf_len: 0,
-            sender: None,
-            sending_key_counter: Arc::default(),
-            sending_index: 0,
-            peer: None,
-        }));
-    }
-    deque
-});
-
-pub struct NetworkTaskData<'a> {
-    // peer: Arc<Peer>,
-    pub data: Box<[u8; MAX_UDP_SIZE]>,
-    pub buf_len: usize,
-    pub peer: Option<Arc<Peer>>,
-    pub res: NeptunResult<'a>,
-}
-
-pub static mut ENCRYPTED_RING_BUFFER: Lazy<VecDeque<Mutex<NetworkTaskData>>> = Lazy::new(|| {
-    let mut deque = VecDeque::with_capacity(RB_SIZE);
-    for _ in 0..RB_SIZE {
-        deque.push_back(Mutex::new(NetworkTaskData {
-            data: Box::new([0; MAX_UDP_SIZE]),
-            buf_len: 0,
-            peer: None,
-            res: NeptunResult::Done,
-        }));
-    }
-    deque
-});
 
 impl std::fmt::Debug for Session {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
@@ -322,6 +274,32 @@ impl Session {
         };
 
         (&mut dst[..DATA_OFFSET + n], DATA_OFFSET + n)
+    }
+
+    pub fn decrypt_data_worker(decrypt_rx: Receiver<usize>, tunnel_tx: Sender<()>) {
+        while let Ok(i) = decrypt_rx.recv_blocking() {
+            if let Some(plaintext) = unsafe { PLAINTEXT_RING_BUFFER.get(i) } {
+                if let Some(encrypted) = unsafe { ENCRYPTED_RING_BUFFER.pop_front() } {
+                    {
+                        let mut src = plaintext.lock();
+                        let mut dst = encrypted.lock();
+                        let data_len = src.buf_len;
+                        let (_, data_len) = Session::encrypt_data_pkt(
+                            src.sending_key_counter.clone(),
+                            src.sending_index,
+                            src.sender.as_ref().unwrap().clone(),
+                            &src.data.as_mut_slice()[..data_len],
+                            dst.data.as_mut_slice(),
+                        );
+                        dst.peer = Some(src.peer.as_ref().unwrap().clone());
+                        dst.buf_len = data_len;
+                        dst.res = NeptunResult::WriteToNetwork(data_len);
+                    }
+                    unsafe { ENCRYPTED_RING_BUFFER.push_back(encrypted) };
+                }
+                let _ = tunnel_tx.send_blocking(());
+            }
+        }
     }
 
     /// packet - a data packet we received from the network

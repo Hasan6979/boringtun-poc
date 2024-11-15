@@ -34,11 +34,15 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::thread::JoinHandle;
+use std::time::Instant;
 
 use crate::noise::errors::WireGuardError;
 use crate::noise::handshake::parse_handshake_anon;
 use crate::noise::rate_limiter::RateLimiter;
-use crate::noise::session::{Session, ENCRYPTED_RING_BUFFER, PLAINTEXT_RING_BUFFER, RB_SIZE};
+use crate::noise::ring_buffers::{
+    DECRYPTION_RING_BUFFER, ENCRYPTED_RING_BUFFER, PLAINTEXT_RING_BUFFER, RB_SIZE,
+};
+use crate::noise::session::Session;
 use crate::noise::{NeptunResult, Packet, Tunn, TunnResult};
 use crate::x25519;
 use allowed_ips::AllowedIps;
@@ -166,7 +170,8 @@ pub struct Device {
     uapi_fd: i32,
 }
 
-static mut ITER: usize = 0;
+static mut IFACE_ITER: usize = 0;
+static mut TUN_ITER: usize = 0;
 
 struct ThreadData {
     iface: Arc<TunSocket>,
@@ -626,15 +631,20 @@ impl Device {
 
                 // Safety: the `recv_from` implementation promises not to write uninitialised
                 // bytes to the buffer, so this casting is safe.
-                let src_buf =
-                    unsafe { &mut *(&mut t.src_buf[..] as *mut [u8] as *mut [MaybeUninit<u8>]) };
-                while let Ok((packet_len, addr)) = udp.recv_from(src_buf) {
-                    let packet = &t.src_buf[..packet_len];
+                // let src_buf =
+                    // unsafe { &mut *(&mut t.src_buf[..] as *mut [u8] as *mut [MaybeUninit<u8>]) };
+                loop {
+                    if let Some(element) = unsafe { DECRYPTION_RING_BUFFER.get_mut(TUN_ITER) } {
+                            let mut item = element.lock();
+                            let src_buf =
+                            unsafe { &mut *(&mut item.data[..] as *mut [u8] as *mut [MaybeUninit<u8>]) };
+                if let Ok((packet_len, addr)) = udp.recv_from(src_buf) {
+                    let packet = &item.data[..packet_len];
                     // The rate limiter initially checks mac1 and mac2, and optionally asks to send a cookie
                     let parsed_packet = match rate_limiter.verify_packet(
                         Some(addr.as_socket().unwrap().ip()),
                         packet,
-                        &mut t.dst_buf,
+                        &mut t.dst_buf, // this can be a simple stack array
                     ) {
                         Ok(packet) => packet,
                         Err(TunnResult::WriteToNetwork(cookie)) => {
@@ -720,7 +730,11 @@ impl Device {
                     if iter == 0 {
                         break;
                     }
+                } else {
+                    break;
                 }
+            }
+            }
                 Action::Continue
             }),
         )?;
@@ -821,7 +835,7 @@ impl Device {
 
                 let peers = &d.peers_by_ip;
                 for _ in 0..MAX_ITR {
-                    if let Some(element) = unsafe { PLAINTEXT_RING_BUFFER.get_mut(ITER) } {
+                    if let Some(element) = unsafe { PLAINTEXT_RING_BUFFER.get_mut(IFACE_ITER) } {
                         let mut is_handshake_msg = false;
                         {
                             let mut item = element.lock();
@@ -895,12 +909,12 @@ impl Device {
                         // unsafe { PLAINTEXT_RING_BUFFER.push_back(element) };
                         // Notify the encrypt part with channel!!
                         if !is_handshake_msg {
-                            let _ = d.encyrpt_tx.send_blocking(unsafe { ITER });
-                            if unsafe { ITER != (RB_SIZE - 1) } {
-                                unsafe { ITER += 1 };
+                            let _ = d.encyrpt_tx.send_blocking(unsafe { IFACE_ITER });
+                            if unsafe { IFACE_ITER != (RB_SIZE - 1) } {
+                                unsafe { IFACE_ITER += 1 };
                             } else {
                                 // Reset the write iterator
-                                unsafe { ITER = 0 };
+                                unsafe { IFACE_ITER = 0 };
                             }
                         }
                         continue;
@@ -926,7 +940,7 @@ fn send_to_network(network_rx: Receiver<()>, udp4: Arc<Socket>, udp6: Arc<Socket
                     }
                     NeptunResult::WriteToNetwork(len) => {
                         let mut endpoint = msg.peer.as_ref().unwrap().endpoint_mut();
-                        let packet = &msg.data.as_slice()[..(*len)];
+                        let packet = &msg.data.as_slice()[..*len];
                         if let Some(conn) = endpoint.conn.as_mut() {
                             // Prefer to send using the connected socket
                             let _: Result<_, _> = conn.write(packet);

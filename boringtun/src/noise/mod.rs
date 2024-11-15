@@ -5,6 +5,7 @@ pub mod errors;
 pub mod handshake;
 pub mod rate_limiter;
 
+pub mod ring_buffers;
 pub mod session;
 pub mod timers;
 

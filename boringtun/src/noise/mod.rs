@@ -9,6 +9,7 @@ pub mod ring_buffers;
 pub mod session;
 pub mod timers;
 
+use ring_buffers::DecryptionTaskData;
 use session::Session;
 
 use crate::noise::errors::WireGuardError;
@@ -60,16 +61,16 @@ impl<'a> From<WireGuardError> for TunnResult<'a> {
 }
 
 #[derive(Debug)]
-pub enum NeptunResult<'a> {
+pub enum NeptunResult {
     Done,
     Err(WireGuardError),
     WriteToNetwork(usize),
-    WriteToTunnelV4(&'a mut [u8], Ipv4Addr),
-    WriteToTunnelV6(&'a mut [u8], Ipv6Addr),
+    WriteToTunnelV4(usize, Ipv4Addr),
+    WriteToTunnelV6(usize, Ipv6Addr),
 }
 
-impl<'a> From<WireGuardError> for NeptunResult<'a> {
-    fn from(err: WireGuardError) -> NeptunResult<'a> {
+impl From<WireGuardError> for NeptunResult {
+    fn from(err: WireGuardError) -> NeptunResult {
         NeptunResult::Err(err)
     }
 }
@@ -125,11 +126,11 @@ pub struct PacketCookieReply<'a> {
     encrypted_cookie: &'a [u8],
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub struct PacketData<'a> {
     pub receiver_idx: u32,
-    counter: u64,
-    encrypted_encapsulated_packet: &'a [u8],
+    pub counter: u64,
+    pub encrypted_encapsulated_packet: &'a [u8],
 }
 
 /// Describes a packet from network
@@ -336,7 +337,7 @@ impl Tunn {
             Packet::HandshakeInit(p) => self.handle_handshake_init(p, dst),
             Packet::HandshakeResponse(p) => self.handle_handshake_response(p, dst),
             Packet::PacketCookieReply(p) => self.handle_cookie_reply(p),
-            Packet::PacketData(p) => self.handle_data(p, dst),
+            Packet::PacketData(p) => Ok(TunnResult::Done),
         }
         .unwrap_or_else(TunnResult::from)
     }
@@ -421,7 +422,7 @@ impl Tunn {
     }
 
     /// Update the index of the currently used session, if needed
-    fn set_current_session(&mut self, new_idx: usize) {
+    pub fn set_current_session(&mut self, new_idx: usize) {
         let cur_idx = self.current;
         if cur_idx == new_idx {
             // There is nothing to do, already using this session, this is the common case
@@ -446,26 +447,27 @@ impl Tunn {
         let idx = r_idx % N_SESSIONS;
 
         // Get the (probably) right session
-        let decapsulated_packet = {
+        {
             let session = self.sessions[idx].as_ref();
             let session = session.ok_or_else(|| {
                 tracing::trace!(message = "No current session available", remote_idx = r_idx);
                 WireGuardError::NoCurrentSession
             })?;
-            Session::decrypt_data_pkt(
-                packet,
-                session.receiving_index,
-                session.receiver.clone(),
-                session.receiving_key_counter.clone(),
-                dst,
-            )?
+            // let decapsulated_packet = Session::decrypt_data_pkt(
+            //     packet,
+            //     session.receiving_index,
+            //     session.receiver.clone(),
+            //     session.receiving_key_counter.clone(),
+            //     dst,
+            // )?;
+            // Tunn::validate_decapsulated_packet(decapsulated_packet);
         };
 
         self.set_current_session(r_idx);
 
         self.timer_tick(TimerName::TimeLastPacketReceived);
 
-        Ok(Tunn::validate_decapsulated_packet(decapsulated_packet))
+        Ok(TunnResult::Done)
     }
 
     /// Formats a new handshake initiation message and store it in dst. If force_resend is true will send
@@ -501,9 +503,9 @@ impl Tunn {
 
     /// Check if an IP packet is v4 or v6, truncate to the length indicated by the length field
     /// Returns the truncated packet and the source IP as TunnResult
-    fn validate_decapsulated_packet<'a>(packet: &'a mut [u8]) -> TunnResult<'a> {
+    fn validate_decapsulated_packet<'a>(packet: &'a mut [u8]) -> NeptunResult {
         let (computed_len, src_ip_address) = match packet.len() {
-            0 => return TunnResult::Done, // This is keepalive, and not an error
+            0 => return NeptunResult::Done, // This is keepalive, and not an error
             _ if packet[0] >> 4 == 4 && packet.len() >= IPV4_MIN_HEADER_SIZE => {
                 let len_bytes: [u8; IP_LEN_SZ] = packet[IPV4_LEN_OFF..IPV4_LEN_OFF + IP_LEN_SZ]
                     .try_into()
@@ -530,11 +532,11 @@ impl Tunn {
                     IpAddr::from(addr_bytes),
                 )
             }
-            _ => return TunnResult::Err(WireGuardError::InvalidPacket),
+            _ => return NeptunResult::Err(WireGuardError::InvalidPacket),
         };
 
         if computed_len > packet.len() {
-            return TunnResult::Err(WireGuardError::InvalidPacket);
+            return NeptunResult::Err(WireGuardError::InvalidPacket);
         }
 
         // Fix this later!!
@@ -542,8 +544,8 @@ impl Tunn {
         // self.rx_bytes += computed_len;
 
         match src_ip_address {
-            IpAddr::V4(addr) => TunnResult::WriteToTunnelV4(&mut packet[..computed_len], addr),
-            IpAddr::V6(addr) => TunnResult::WriteToTunnelV6(&mut packet[..computed_len], addr),
+            IpAddr::V4(addr) => NeptunResult::WriteToTunnelV4(computed_len, addr),
+            IpAddr::V6(addr) => NeptunResult::WriteToTunnelV6(computed_len, addr),
         }
     }
 

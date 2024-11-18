@@ -2,16 +2,21 @@
 // SPDX-License-Identifier: BSD-3-Clause
 
 use super::{
-    ring_buffers::{ENCRYPTED_RING_BUFFER, PLAINTEXT_RING_BUFFER},
-    NeptunResult, PacketData,
+    ring_buffers::{
+        DECRYPTED_RING_BUFFER, ENCRYPTED_RING_BUFFER, PLAINTEXT_RING_BUFFER, RX_RING_BUFFER,
+    },
+    NeptunResult, PacketData, Tunn,
 };
 use crate::noise::errors::WireGuardError;
 use async_channel::{Receiver, Sender};
 use parking_lot::Mutex;
 use ring::aead::{Aad, LessSafeKey, Nonce, UnboundKey, CHACHA20_POLY1305};
-use std::sync::{
-    atomic::{AtomicUsize, Ordering},
-    Arc,
+use std::{
+    convert::TryInto,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
 };
 
 pub struct Session {
@@ -278,27 +283,37 @@ impl Session {
 
     pub fn decrypt_data_worker(decrypt_rx: Receiver<usize>, tunnel_tx: Sender<()>) {
         while let Ok(i) = decrypt_rx.recv_blocking() {
-            if let Some(plaintext) = unsafe { PLAINTEXT_RING_BUFFER.get(i) } {
-                if let Some(encrypted) = unsafe { ENCRYPTED_RING_BUFFER.pop_front() } {
+            if let Some(encrpyted_msg) = unsafe { RX_RING_BUFFER.get(i) } {
+                if let Some(decrypted) = unsafe { DECRYPTED_RING_BUFFER.pop_front() } {
                     {
-                        let mut src = plaintext.lock();
-                        let mut dst = encrypted.lock();
+                        let src = encrpyted_msg.lock();
+                        let mut dst = decrypted.lock();
                         let data_len = src.buf_len;
-                        let (_, data_len) = Session::encrypt_data_pkt(
-                            src.sending_key_counter.clone(),
-                            src.sending_index,
-                            src.sender.as_ref().unwrap().clone(),
-                            &src.data.as_mut_slice()[..data_len],
+                        let decapsulated_packet = Session::decrypt_data_pkt(
+                            PacketData {
+                                receiver_idx: u32::from_le_bytes(
+                                    src.data[4..8].try_into().unwrap(),
+                                ),
+                                counter: src.counter,
+                                encrypted_encapsulated_packet: &src.data[16..data_len],
+                            },
+                            src.receiving_index,
+                            src.receiver.as_ref().unwrap().clone(),
+                            src.receiving_key_counter.clone(),
                             dst.data.as_mut_slice(),
                         );
+                        dst.res = match decapsulated_packet {
+                            Ok(len) => Tunn::validate_decapsulated_packet(
+                                &mut dst.data.as_mut_slice()[..len],
+                            ),
+                            Err(e) => NeptunResult::Err(e),
+                        };
                         dst.peer = Some(src.peer.as_ref().unwrap().clone());
-                        dst.buf_len = data_len;
-                        dst.res = NeptunResult::WriteToNetwork(data_len);
                     }
-                    unsafe { ENCRYPTED_RING_BUFFER.push_back(encrypted) };
+                    unsafe { DECRYPTED_RING_BUFFER.push_back(decrypted) };
                 }
-                let _ = tunnel_tx.send_blocking(());
             }
+            let _ = tunnel_tx.send_blocking(());
         }
     }
 
@@ -312,13 +327,14 @@ impl Session {
         receiver: Arc<LessSafeKey>,
         receiving_key_counter: Arc<Mutex<ReceivingKeyCounterValidator>>,
         dst: &'a mut [u8],
-    ) -> Result<&'a mut [u8], WireGuardError> {
+    ) -> Result<usize, WireGuardError> {
         let ct_len = packet.encrypted_encapsulated_packet.len();
         if dst.len() < ct_len {
             // This is a very incorrect use of the library, therefore panic and not error
             panic!("The destination buffer is too small");
         }
         if packet.receiver_idx != receiving_index {
+            tracing::debug!("pkt rx {} rx_idx {}", packet.receiver_idx, receiving_index);
             return Err(WireGuardError::WrongIndex);
         }
         // Don't reuse counters, in case this is a replay attack we want to quickly check the counter without running expensive decryption
@@ -339,7 +355,7 @@ impl Session {
 
         // After decryption is done, check counter again, and mark as received
         Session::receiving_counter_mark(receiving_key_counter.clone(), packet.counter)?;
-        Ok(ret)
+        Ok(ret.len())
     }
 
     /// Returns the estimated downstream packet loss for this session

@@ -40,7 +40,7 @@ use crate::noise::errors::WireGuardError;
 use crate::noise::handshake::parse_handshake_anon;
 use crate::noise::rate_limiter::RateLimiter;
 use crate::noise::ring_buffers::{
-    DECRYPTION_RING_BUFFER, ENCRYPTED_RING_BUFFER, PLAINTEXT_RING_BUFFER, RB_SIZE,
+    DECRYPTED_RING_BUFFER, ENCRYPTED_RING_BUFFER, PLAINTEXT_RING_BUFFER, RB_SIZE, RX_RING_BUFFER,
 };
 use crate::noise::session::Session;
 use crate::noise::{NeptunResult, Packet, Tunn, TunnResult};
@@ -166,6 +166,10 @@ pub struct Device {
     encyrpt_tx: Sender<usize>,
     network_rx: Receiver<()>,
     network_tx: Sender<()>,
+
+    decyrpt_tx: Sender<usize>,
+    tunnel_rx: Receiver<()>,
+    tunnel_tx: Sender<()>,
     #[cfg(target_os = "linux")]
     uapi_fd: i32,
 }
@@ -376,6 +380,9 @@ impl Device {
         let (encyrpt_tx, encrypt_rx) = async_channel::bounded(1024);
         let (network_tx, network_rx) = async_channel::bounded(1024);
 
+        let (decyrpt_tx, decrypt_rx) = async_channel::bounded(1024);
+        let (tunnel_tx, tunnel_rx) = async_channel::bounded(1024);
+
         let mut device = Device {
             queue: Arc::new(poll),
             iface,
@@ -397,6 +404,9 @@ impl Device {
             encyrpt_tx: encyrpt_tx.clone(),
             network_tx: network_tx.clone(),
             network_rx,
+            decyrpt_tx: decyrpt_tx.clone(),
+            tunnel_tx: tunnel_tx.clone(),
+            tunnel_rx,
             #[cfg(target_os = "linux")]
             uapi_fd,
         };
@@ -412,6 +422,9 @@ impl Device {
 
         let rx_clone = encrypt_rx.clone();
         std::thread::spawn(move || Session::encrypt_data_worker(rx_clone, network_tx));
+
+        let rx_clone = decrypt_rx.clone();
+        std::thread::spawn(move || Session::decrypt_data_worker(rx_clone, tunnel_tx));
 
         #[cfg(target_os = "macos")]
         {
@@ -470,6 +483,9 @@ impl Device {
         let uv4 = Arc::new(udp_sock4).clone();
         let uv6 = Arc::new(udp_sock6).clone();
         std::thread::spawn(move || send_to_network(rx_clone, uv4, uv6));
+        let iface = self.iface.clone();
+        let rx_clone = self.tunnel_rx.clone();
+        std::thread::spawn(move || send_to_tunnel(rx_clone, iface));
         self.listen_port = port;
 
         Ok(())
@@ -634,17 +650,19 @@ impl Device {
                 // let src_buf =
                     // unsafe { &mut *(&mut t.src_buf[..] as *mut [u8] as *mut [MaybeUninit<u8>]) };
                 loop {
-                    if let Some(element) = unsafe { DECRYPTION_RING_BUFFER.get_mut(TUN_ITER) } {
+                    if let Some(element) = unsafe { RX_RING_BUFFER.get_mut(TUN_ITER) } {
                             let mut item = element.lock();
                             let src_buf =
                             unsafe { &mut *(&mut item.data[..] as *mut [u8] as *mut [MaybeUninit<u8>]) };
                 if let Ok((packet_len, addr)) = udp.recv_from(src_buf) {
+                    let mut data_pkt = None;
                     let packet = &item.data[..packet_len];
                     // The rate limiter initially checks mac1 and mac2, and optionally asks to send a cookie
+                    let mut dst_buf = [0u8; 4096];
                     let parsed_packet = match rate_limiter.verify_packet(
                         Some(addr.as_socket().unwrap().ip()),
                         packet,
-                        &mut t.dst_buf, // this can be a simple stack array
+                        &mut dst_buf, // this can be a simple stack array
                     ) {
                         Ok(packet) => packet,
                         Err(TunnResult::WriteToNetwork(cookie)) => {
@@ -664,7 +682,7 @@ impl Device {
                         }
                         Packet::HandshakeResponse(p) => d.peers_by_idx.get(&(p.receiver_idx >> 8)),
                         Packet::PacketCookieReply(p) => d.peers_by_idx.get(&(p.receiver_idx >> 8)),
-                        Packet::PacketData(p) => d.peers_by_idx.get(&(p.receiver_idx >> 8)),
+                        Packet::PacketData(p) => { data_pkt = Some(p); d.peers_by_idx.get(&(p.receiver_idx >> 8))},
                     };
 
                     let peer = match peer {
@@ -676,7 +694,36 @@ impl Device {
                     let mut flush = false; // Are there packets to send from the queue?
                     let res = {
                         let mut tun = peer.tunnel.lock();
-                        tun.handle_verified_packet(parsed_packet, &mut t.dst_buf[..])
+                        if let Some(pkt) = data_pkt {
+                            let r_idx = pkt.receiver_idx as usize;
+                            let idx = r_idx % N_SESSIONS;
+                            // Get the (probably) right session
+                            {
+                                let session = tun.sessions[idx].as_ref();
+                                match session {
+                                    Some(session) => {
+                                        item.counter = pkt.counter;
+                                        item.buf_len = packet_len;
+                                        item.receiving_index = session.receiving_index;
+                                        item.receiver = Some(session.receiver.clone());
+                                        item.receiving_key_counter = session.receiving_key_counter.clone();
+                                        item.peer = Some(peer.clone());
+                                        tun.set_current_session(r_idx);
+                                        let _ = d.decyrpt_tx.send_blocking(unsafe { TUN_ITER });
+                                        if unsafe { TUN_ITER != (RB_SIZE - 1) } {
+                                            unsafe { TUN_ITER += 1 };
+                                        } else {
+                                            // Reset the write iterator
+                                            unsafe { TUN_ITER = 0 };
+                                        }
+                                        TunnResult::Done},
+                                    None => {tracing::trace!(message = "No current session available", remote_idx = r_idx);
+                                        TunnResult::Err(WireGuardError::NoCurrentSession)}
+                                }
+                            }
+                        } else {
+                            tun.handle_verified_packet(parsed_packet, &mut t.dst_buf[..])
+                        }
                     };
                     match res {
                         TunnResult::Done => {}
@@ -876,6 +923,7 @@ impl Device {
                                     item.sender = Some(session.sender.clone());
                                     item.sending_key_counter = session.sending_key_counter.clone();
                                     item.peer = Some(peer.clone());
+                                    // Update the timers!
                                 } else {
                                     // Initiate handshake
                                     if let Some(entry) =
@@ -906,7 +954,6 @@ impl Device {
                                 }
                             };
                         }
-                        // unsafe { PLAINTEXT_RING_BUFFER.push_back(element) };
                         // Notify the encrypt part with channel!!
                         if !is_handshake_msg {
                             let _ = d.encyrpt_tx.send_blocking(unsafe { IFACE_ITER });
@@ -925,6 +972,36 @@ impl Device {
             }),
         )?;
         Ok(())
+    }
+}
+
+fn send_to_tunnel(tunnel_rx: Receiver<()>, iface: Arc<TunSocket>) {
+    while tunnel_rx.recv_blocking().is_ok() {
+        if let Some(elem) = unsafe { DECRYPTED_RING_BUFFER.pop_back() } {
+            {
+                let msg = elem.lock();
+                match &msg.res {
+                    NeptunResult::Done => {}
+                    NeptunResult::Err(e) => {
+                        tracing::error!(message = "Encapsulate error", error = ?e)
+                    }
+                    NeptunResult::WriteToTunnelV4(buf_len, addr) => {
+                        if msg.peer.as_ref().unwrap().is_allowed_ip(*addr) {
+                            iface.write4(&msg.data.as_slice()[..*buf_len]);
+                        }
+                    }
+                    NeptunResult::WriteToTunnelV6(buf_len, addr) => {
+                        if msg.peer.as_ref().unwrap().is_allowed_ip(*addr) {
+                            iface.write6(&msg.data.as_slice()[..*buf_len]);
+                        }
+                    }
+                    _ => panic!("Unexpected result from encapsulate"),
+                };
+            }
+            unsafe {
+                DECRYPTED_RING_BUFFER.push_front(elem);
+            }
+        }
     }
 }
 

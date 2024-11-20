@@ -9,7 +9,7 @@ use std::{
 };
 const MAX_UDP_SIZE: usize = (1 << 16) - 1;
 
-pub const RB_SIZE: usize = 10;
+pub const RB_SIZE: usize = 100;
 
 pub struct DecryptionTaskData {
     pub receiver_idx: u32,

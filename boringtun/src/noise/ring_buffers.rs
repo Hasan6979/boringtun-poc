@@ -5,11 +5,14 @@ use parking_lot::Mutex;
 use ring::aead::LessSafeKey;
 use std::{
     collections::VecDeque,
-    sync::{atomic::AtomicUsize, Arc},
+    sync::{
+        atomic::{AtomicBool, AtomicUsize},
+        Arc,
+    },
 };
-const MAX_UDP_SIZE: usize = (1 << 16) - 1;
+const MAX_UDP_SIZE: usize = (1 << 14) - 1;
 
-pub const RB_SIZE: usize = 100;
+pub const RB_SIZE: usize = 10;
 
 pub struct DecryptionTaskData {
     pub receiver_idx: u32,
@@ -20,12 +23,13 @@ pub struct DecryptionTaskData {
     pub data: [u8; MAX_UDP_SIZE],
     pub buf_len: usize,
     pub peer: Option<Arc<Peer>>,
+    pub is_element_free: AtomicBool,
 }
 
-pub static mut RX_RING_BUFFER: Lazy<VecDeque<Mutex<DecryptionTaskData>>> = Lazy::new(|| {
+pub static mut RX_RING_BUFFER: Lazy<VecDeque<DecryptionTaskData>> = Lazy::new(|| {
     let mut deque = VecDeque::with_capacity(RB_SIZE);
     for _ in 0..RB_SIZE {
-        deque.push_back(Mutex::new(DecryptionTaskData {
+        deque.push_back(DecryptionTaskData {
             receiver_idx: 0,
             counter: 0,
             data: [0u8; MAX_UDP_SIZE],
@@ -34,7 +38,8 @@ pub static mut RX_RING_BUFFER: Lazy<VecDeque<Mutex<DecryptionTaskData>>> = Lazy:
             receiving_key_counter: Arc::default(),
             receiving_index: 0,
             peer: None,
-        }));
+            is_element_free: AtomicBool::new(true),
+        });
     }
     deque
 });
@@ -46,19 +51,21 @@ pub struct EncryptionTaskData {
     pub sending_key_counter: Arc<AtomicUsize>,
     pub sending_index: u32,
     pub peer: Option<Arc<Peer>>,
+    pub is_element_free: AtomicBool,
 }
 
-pub static mut PLAINTEXT_RING_BUFFER: Lazy<VecDeque<Mutex<EncryptionTaskData>>> = Lazy::new(|| {
+pub static mut PLAINTEXT_RING_BUFFER: Lazy<VecDeque<EncryptionTaskData>> = Lazy::new(|| {
     let mut deque = VecDeque::with_capacity(RB_SIZE);
     for _ in 0..RB_SIZE {
-        deque.push_back(Mutex::new(EncryptionTaskData {
+        deque.push_back(EncryptionTaskData {
             data: [0; MAX_UDP_SIZE],
             buf_len: 0,
             sender: None,
             sending_key_counter: Arc::default(),
             sending_index: 0,
             peer: None,
-        }));
+            is_element_free: AtomicBool::new(true),
+        });
     }
     deque
 });
@@ -68,30 +75,33 @@ pub struct NetworkTaskData {
     pub buf_len: usize,
     pub peer: Option<Arc<Peer>>,
     pub res: NeptunResult,
+    pub is_element_free: AtomicBool,
 }
 
-pub static mut ENCRYPTED_RING_BUFFER: Lazy<VecDeque<Mutex<NetworkTaskData>>> = Lazy::new(|| {
+pub static mut ENCRYPTED_RING_BUFFER: Lazy<VecDeque<NetworkTaskData>> = Lazy::new(|| {
     let mut deque = VecDeque::with_capacity(RB_SIZE);
     for _ in 0..RB_SIZE {
-        deque.push_back(Mutex::new(NetworkTaskData {
+        deque.push_back(NetworkTaskData {
             data: [0; MAX_UDP_SIZE],
             buf_len: 0,
             peer: None,
             res: NeptunResult::Done,
-        }));
+            is_element_free: AtomicBool::new(true),
+        });
     }
     deque
 });
 
-pub static mut DECRYPTED_RING_BUFFER: Lazy<VecDeque<Mutex<NetworkTaskData>>> = Lazy::new(|| {
+pub static mut DECRYPTED_RING_BUFFER: Lazy<VecDeque<NetworkTaskData>> = Lazy::new(|| {
     let mut deque = VecDeque::with_capacity(RB_SIZE);
     for _ in 0..RB_SIZE {
-        deque.push_back(Mutex::new(NetworkTaskData {
+        deque.push_back(NetworkTaskData {
             data: [0; MAX_UDP_SIZE],
             buf_len: 0,
             peer: None,
             res: NeptunResult::Done,
-        }));
+            is_element_free: AtomicBool::new(true),
+        });
     }
     deque
 });

@@ -9,7 +9,6 @@ pub mod ring_buffers;
 pub mod session;
 pub mod timers;
 
-use ring_buffers::DecryptionTaskData;
 use session::Session;
 
 use crate::noise::errors::WireGuardError;

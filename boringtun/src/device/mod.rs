@@ -40,7 +40,8 @@ use crate::noise::errors::WireGuardError;
 use crate::noise::handshake::parse_handshake_anon;
 use crate::noise::rate_limiter::RateLimiter;
 use crate::noise::ring_buffers::{
-    DECRYPTED_RING_BUFFER, ENCRYPTED_RING_BUFFER, PLAINTEXT_RING_BUFFER, RB_SIZE, RX_RING_BUFFER,
+    DecryptionTaskData, EncryptionTaskData, NetworkTaskData, ENCRYPTED_RING_BUFFER,
+    PLAINTEXT_RING_BUFFER, RB_SIZE, RX_RING_BUFFER,
 };
 use crate::noise::session::Session;
 use crate::noise::{NeptunResult, Packet, Tunn, TunnResult};
@@ -164,13 +165,14 @@ pub struct Device {
 
     rate_limiter: Option<Arc<RateLimiter>>,
 
-    encyrpt_tx: Sender<usize>,
-    network_rx: Receiver<usize>,
-    network_tx: Sender<usize>,
+    encyrpt_tx: Sender<&'static EncryptionTaskData>,
+    decyrpt_tx: Sender<&'static DecryptionTaskData>,
 
-    decyrpt_tx: Sender<usize>,
-    tunnel_rx: Receiver<usize>,
-    tunnel_tx: Sender<usize>,
+    network_rx: Receiver<&'static NetworkTaskData>,
+    network_tx: Sender<&'static NetworkTaskData>,
+
+    tunnel_rx: Receiver<&'static NetworkTaskData>,
+    tunnel_tx: Sender<&'static NetworkTaskData>,
     #[cfg(target_os = "linux")]
     uapi_fd: i32,
 }
@@ -651,13 +653,13 @@ impl Device {
                 // let src_buf =
                     // unsafe { &mut *(&mut t.src_buf[..] as *mut [u8] as *mut [MaybeUninit<u8>]) };
                 loop {
-                    if let Some(element) = unsafe { RX_RING_BUFFER.get_mut(TUN_ITER) } {
-                            let mut item = element.lock();
+                    let element = unsafe { &mut RX_RING_BUFFER[TUN_ITER] };
+                    if element.is_element_free.load(Ordering::Relaxed) {
                             let src_buf =
-                            unsafe { &mut *(&mut item.data[..] as *mut [u8] as *mut [MaybeUninit<u8>]) };
+                            unsafe { &mut *(&mut element.data[..] as *mut [u8] as *mut [MaybeUninit<u8>]) };
                 if let Ok((packet_len, addr)) = udp.recv_from(src_buf) {
                     let mut data_pkt = None;
-                    let packet = &item.data[..packet_len];
+                    let packet = &element.data[..packet_len];
                     // The rate limiter initially checks mac1 and mac2, and optionally asks to send a cookie
                     let mut dst_buf = [0u8; 4096];
                     let parsed_packet = match rate_limiter.verify_packet(
@@ -703,14 +705,15 @@ impl Device {
                                 let session = tun.sessions[idx].as_ref();
                                 match session {
                                     Some(session) => {
-                                        item.counter = pkt.counter;
-                                        item.buf_len = packet_len;
-                                        item.receiving_index = session.receiving_index;
-                                        item.receiver = Some(session.receiver.clone());
-                                        item.receiving_key_counter = session.receiving_key_counter.clone();
-                                        item.peer = Some(peer.clone());
+                                        element.counter = pkt.counter;
+                                        element.buf_len = packet_len;
+                                        element.receiving_index = session.receiving_index;
+                                        element.receiver = Some(session.receiver.clone());
+                                        element.receiving_key_counter = session.receiving_key_counter.clone();
+                                        element.peer = Some(peer.clone());
                                         tun.set_current_session(r_idx);
-                                        let _ = d.decyrpt_tx.send_blocking(unsafe { TUN_ITER });
+                                        element.is_element_free.store(false, Ordering::Relaxed);
+                                        let _ = d.decyrpt_tx.send_blocking(element);
                                         if unsafe { TUN_ITER != (RB_SIZE - 1) } {
                                             unsafe { TUN_ITER += 1 };
                                         } else {
@@ -883,11 +886,11 @@ impl Device {
 
                 let peers = &d.peers_by_ip;
                 for _ in 0..MAX_ITR {
-                    if let Some(element) = unsafe { PLAINTEXT_RING_BUFFER.get_mut(IFACE_ITER) } {
+                    let element = unsafe { &mut PLAINTEXT_RING_BUFFER[IFACE_ITER] };
+                    if element.is_element_free.load(Ordering::Relaxed) {
                         let mut is_handshake_msg = false;
                         {
-                            let mut item = element.lock();
-                            let src = match iface.read(&mut item.data[..mtu]) {
+                            let src = match iface.read(&mut element.data[..mtu]) {
                                 Ok(src) => src,
                                 Err(Error::IfaceRead(e)) => {
                                     let ek = e.kind();
@@ -915,24 +918,22 @@ impl Device {
                                 None => continue,
                             };
                             {
-                                // tracing::info!("TL");
                                 let mut tun = peer.tunnel.lock();
                                 let current = tun.current;
                                 if let Some(ref session) = tun.sessions[current % N_SESSIONS] {
                                     // Send the packet using an established session
-                                    item.buf_len = src.len();
-                                    item.sending_index = session.sending_index;
-                                    item.sender = Some(session.sender.clone());
-                                    item.sending_key_counter = session.sending_key_counter.clone();
-                                    item.peer = Some(peer.clone());
-                                    // tracing::info!("SL");
+                                    element.buf_len = src.len();
+                                    element.sending_index = session.sending_index;
+                                    element.sender = Some(session.sender.clone());
+                                    element.sending_key_counter =
+                                        session.sending_key_counter.clone();
+                                    element.peer = Some(peer.clone());
                                     // Update the timers!
                                 } else {
                                     // Initiate handshake
-                                    if let Some(entry) = unsafe { ENCRYPTED_RING_BUFFER.get_mut(0) }
-                                    {
+                                    // TODO: Have to fix this. This can't be a hardcoded 0th iter
+                                    if let Some(dst) = unsafe { ENCRYPTED_RING_BUFFER.get_mut(0) } {
                                         {
-                                            let mut dst = entry.lock();
                                             dst.peer = Some(peer.clone());
                                             let res = tun.format_handshake_initiation(
                                                 dst.data.as_mut_slice(),
@@ -951,7 +952,8 @@ impl Device {
                                         };
                                         // This has to change. Atm, can handle only 1 and only
                                         // at the beginning
-                                        let _ = d.network_tx.send_blocking(0);
+                                        dst.is_element_free.store(false, Ordering::Relaxed);
+                                        let _ = d.network_tx.send_blocking(dst);
                                         is_handshake_msg = true;
                                     }
                                 }
@@ -959,8 +961,8 @@ impl Device {
                         }
                         // Notify the encrypt part with channel!!
                         if !is_handshake_msg {
-                            // tracing::info!("NEW");
-                            let _ = d.encyrpt_tx.send_blocking(unsafe { IFACE_ITER });
+                            element.is_element_free.store(false, Ordering::Relaxed);
+                            let _ = d.encyrpt_tx.send_blocking(element);
                             if unsafe { IFACE_ITER != (RB_SIZE - 1) } {
                                 unsafe { IFACE_ITER += 1 };
                             } else {
@@ -979,61 +981,53 @@ impl Device {
     }
 }
 
-fn send_to_tunnel(tunnel_rx: Receiver<usize>, iface: Arc<TunSocket>) {
-    while let Ok(i) = tunnel_rx.recv_blocking() {
-        if let Some(elem) = unsafe { DECRYPTED_RING_BUFFER.get(i) } {
-            {
-                let msg = elem.lock();
-                match &msg.res {
-                    NeptunResult::Done => {}
-                    NeptunResult::Err(e) => {
-                        tracing::error!(message = "Decapsulate error", error = ?e)
-                    }
-                    NeptunResult::WriteToTunnelV4(buf_len, addr) => {
-                        if msg.peer.as_ref().unwrap().is_allowed_ip(*addr) {
-                            iface.write4(&msg.data.as_slice()[..*buf_len]);
-                        }
-                    }
-                    NeptunResult::WriteToTunnelV6(buf_len, addr) => {
-                        if msg.peer.as_ref().unwrap().is_allowed_ip(*addr) {
-                            iface.write6(&msg.data.as_slice()[..*buf_len]);
-                        }
-                    }
-                    _ => panic!("Unexpected result from encapsulate"),
-                };
+fn send_to_tunnel(tunnel_rx: Receiver<&NetworkTaskData>, iface: Arc<TunSocket>) {
+    while let Ok(msg) = tunnel_rx.recv_blocking() {
+        match &msg.res {
+            NeptunResult::Done => {}
+            NeptunResult::Err(e) => {
+                tracing::error!(message = "Decapsulate error", error = ?e)
             }
-        }
+            NeptunResult::WriteToTunnelV4(buf_len, addr) => {
+                if msg.peer.as_ref().unwrap().is_allowed_ip(*addr) {
+                    iface.write4(&msg.data.as_slice()[..*buf_len]);
+                }
+            }
+            NeptunResult::WriteToTunnelV6(buf_len, addr) => {
+                if msg.peer.as_ref().unwrap().is_allowed_ip(*addr) {
+                    iface.write6(&msg.data.as_slice()[..*buf_len]);
+                }
+            }
+            _ => panic!("Unexpected result from encapsulate"),
+        };
+        msg.is_element_free.store(true, Ordering::Relaxed);
     }
 }
 
-fn send_to_network(network_rx: Receiver<usize>, udp4: Arc<Socket>, udp6: Arc<Socket>) {
-    while let Ok(i) = network_rx.recv_blocking() {
-        if let Some(elem) = unsafe { ENCRYPTED_RING_BUFFER.get(i) } {
-            {
-                let msg = elem.lock();
-                match &msg.res {
-                    NeptunResult::Done => {}
-                    NeptunResult::Err(e) => {
-                        tracing::error!(message = "Encapsulate error", error = ?e)
-                    }
-                    NeptunResult::WriteToNetwork(len) => {
-                        let mut endpoint = msg.peer.as_ref().unwrap().endpoint_mut();
-                        let packet = &msg.data.as_slice()[..*len];
-                        if let Some(conn) = endpoint.conn.as_mut() {
-                            // Prefer to send using the connected socket
-                            let _: Result<_, _> = conn.write(packet);
-                        } else if let Some(addr @ SocketAddr::V4(_)) = endpoint.addr {
-                            let _: Result<_, _> = udp4.send_to(packet, &addr.into());
-                        } else if let Some(addr @ SocketAddr::V6(_)) = endpoint.addr {
-                            let _: Result<_, _> = udp6.send_to(packet, &addr.into());
-                        } else {
-                            tracing::error!("No endpoint");
-                        }
-                    }
-                    _ => panic!("Unexpected result from encapsulate"),
-                };
+fn send_to_network(network_rx: Receiver<&NetworkTaskData>, udp4: Arc<Socket>, udp6: Arc<Socket>) {
+    while let Ok(msg) = network_rx.recv_blocking() {
+        match &msg.res {
+            NeptunResult::Done => {}
+            NeptunResult::Err(e) => {
+                tracing::error!(message = "Encapsulate error", error = ?e)
             }
-        }
+            NeptunResult::WriteToNetwork(len) => {
+                let mut endpoint = msg.peer.as_ref().unwrap().endpoint_mut();
+                let packet = &msg.data.as_slice()[..*len];
+                if let Some(conn) = endpoint.conn.as_mut() {
+                    // Prefer to send using the connected socket
+                    let _: Result<_, _> = conn.write(packet);
+                } else if let Some(addr @ SocketAddr::V4(_)) = endpoint.addr {
+                    let _: Result<_, _> = udp4.send_to(packet, &addr.into());
+                } else if let Some(addr @ SocketAddr::V6(_)) = endpoint.addr {
+                    let _: Result<_, _> = udp6.send_to(packet, &addr.into());
+                } else {
+                    tracing::error!("No endpoint");
+                }
+            }
+            _ => panic!("Unexpected result from encapsulate"),
+        };
+        msg.is_element_free.store(true, Ordering::Relaxed);
     }
 }
 

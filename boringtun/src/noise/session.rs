@@ -3,7 +3,8 @@
 
 use super::{
     ring_buffers::{
-        DECRYPTED_RING_BUFFER, ENCRYPTED_RING_BUFFER, PLAINTEXT_RING_BUFFER, RX_RING_BUFFER,
+        DECRYPTED_RING_BUFFER, ENCRYPTED_RING_BUFFER, PLAINTEXT_RING_BUFFER, RB_SIZE,
+        RX_RING_BUFFER,
     },
     NeptunResult, PacketData, Tunn,
 };
@@ -27,6 +28,9 @@ pub struct Session {
     pub sending_key_counter: Arc<AtomicUsize>,
     pub receiving_key_counter: Arc<Mutex<ReceivingKeyCounterValidator>>,
 }
+
+static mut ENCRYPT_ITER: usize = 0;
+static mut DECRYPT_ITER: usize = 0;
 
 impl std::fmt::Debug for Session {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
@@ -210,10 +214,10 @@ impl Session {
         ret
     }
 
-    pub fn encrypt_data_worker(encrypt_rx: Receiver<usize>, network_tx: Sender<()>) {
+    pub fn encrypt_data_worker(encrypt_rx: Receiver<usize>, network_tx: Sender<usize>) {
         while let Ok(i) = encrypt_rx.recv_blocking() {
             if let Some(plaintext) = unsafe { PLAINTEXT_RING_BUFFER.get(i) } {
-                if let Some(encrypted) = unsafe { ENCRYPTED_RING_BUFFER.pop_front() } {
+                if let Some(encrypted) = unsafe { ENCRYPTED_RING_BUFFER.get_mut(ENCRYPT_ITER) } {
                     {
                         let mut src = plaintext.lock();
                         let mut dst = encrypted.lock();
@@ -229,9 +233,14 @@ impl Session {
                         dst.buf_len = data_len;
                         dst.res = NeptunResult::WriteToNetwork(data_len);
                     }
-                    unsafe { ENCRYPTED_RING_BUFFER.push_back(encrypted) };
                 }
-                let _ = network_tx.send_blocking(());
+                let _ = network_tx.send_blocking(unsafe { ENCRYPT_ITER });
+                if unsafe { ENCRYPT_ITER != (RB_SIZE - 1) } {
+                    unsafe { ENCRYPT_ITER += 1 };
+                } else {
+                    // Reset the write iterator
+                    unsafe { ENCRYPT_ITER = 0 };
+                }
             }
         }
     }
@@ -281,10 +290,10 @@ impl Session {
         (&mut dst[..DATA_OFFSET + n], DATA_OFFSET + n)
     }
 
-    pub fn decrypt_data_worker(decrypt_rx: Receiver<usize>, tunnel_tx: Sender<()>) {
+    pub fn decrypt_data_worker(decrypt_rx: Receiver<usize>, tunnel_tx: Sender<usize>) {
         while let Ok(i) = decrypt_rx.recv_blocking() {
             if let Some(encrpyted_msg) = unsafe { RX_RING_BUFFER.get(i) } {
-                if let Some(decrypted) = unsafe { DECRYPTED_RING_BUFFER.pop_front() } {
+                if let Some(decrypted) = unsafe { DECRYPTED_RING_BUFFER.get_mut(DECRYPT_ITER) } {
                     {
                         let src = encrpyted_msg.lock();
                         let mut dst = decrypted.lock();
@@ -310,10 +319,15 @@ impl Session {
                         };
                         dst.peer = Some(src.peer.as_ref().unwrap().clone());
                     }
-                    unsafe { DECRYPTED_RING_BUFFER.push_back(decrypted) };
                 }
             }
-            let _ = tunnel_tx.send_blocking(());
+            let _ = tunnel_tx.send_blocking(unsafe { DECRYPT_ITER });
+            if unsafe { DECRYPT_ITER != (RB_SIZE - 1) } {
+                unsafe { DECRYPT_ITER += 1 };
+            } else {
+                // Reset the write iterator
+                unsafe { DECRYPT_ITER = 0 };
+            }
         }
     }
 

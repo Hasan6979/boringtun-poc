@@ -47,6 +47,7 @@ use crate::noise::{NeptunResult, Packet, Tunn, TunnResult};
 use crate::x25519;
 use allowed_ips::AllowedIps;
 use async_channel::{Receiver, Sender};
+use once_cell::sync::Lazy;
 use peer::{AllowedIP, Peer};
 use poll::{EventPoll, EventRef, WaitResult};
 use rand_core::{OsRng, RngCore};
@@ -164,12 +165,12 @@ pub struct Device {
     rate_limiter: Option<Arc<RateLimiter>>,
 
     encyrpt_tx: Sender<usize>,
-    network_rx: Receiver<()>,
-    network_tx: Sender<()>,
+    network_rx: Receiver<usize>,
+    network_tx: Sender<usize>,
 
     decyrpt_tx: Sender<usize>,
-    tunnel_rx: Receiver<()>,
-    tunnel_tx: Sender<()>,
+    tunnel_rx: Receiver<usize>,
+    tunnel_tx: Sender<usize>,
     #[cfg(target_os = "linux")]
     uapi_fd: i32,
 }
@@ -377,11 +378,11 @@ impl Device {
         let uapi_fd = -1;
         #[cfg(target_os = "linux")]
         let uapi_fd = config.uapi_fd;
-        let (encyrpt_tx, encrypt_rx) = async_channel::bounded(1024);
-        let (network_tx, network_rx) = async_channel::bounded(1024);
+        let (encyrpt_tx, encrypt_rx) = async_channel::bounded(RB_SIZE);
+        let (network_tx, network_rx) = async_channel::bounded(RB_SIZE);
 
-        let (decyrpt_tx, decrypt_rx) = async_channel::bounded(1024);
-        let (tunnel_tx, tunnel_rx) = async_channel::bounded(1024);
+        let (decyrpt_tx, decrypt_rx) = async_channel::bounded(RB_SIZE);
+        let (tunnel_tx, tunnel_rx) = async_channel::bounded(RB_SIZE);
 
         let mut device = Device {
             queue: Arc::new(poll),
@@ -914,6 +915,7 @@ impl Device {
                                 None => continue,
                             };
                             {
+                                // tracing::info!("TL");
                                 let mut tun = peer.tunnel.lock();
                                 let current = tun.current;
                                 if let Some(ref session) = tun.sessions[current % N_SESSIONS] {
@@ -923,11 +925,11 @@ impl Device {
                                     item.sender = Some(session.sender.clone());
                                     item.sending_key_counter = session.sending_key_counter.clone();
                                     item.peer = Some(peer.clone());
+                                    // tracing::info!("SL");
                                     // Update the timers!
                                 } else {
                                     // Initiate handshake
-                                    if let Some(entry) =
-                                        unsafe { ENCRYPTED_RING_BUFFER.pop_front() }
+                                    if let Some(entry) = unsafe { ENCRYPTED_RING_BUFFER.get_mut(0) }
                                     {
                                         {
                                             let mut dst = entry.lock();
@@ -947,8 +949,9 @@ impl Device {
                                                 _ => continue,
                                             }
                                         };
-                                        unsafe { ENCRYPTED_RING_BUFFER.push_back(entry) };
-                                        let _ = d.network_tx.send_blocking(());
+                                        // This has to change. Atm, can handle only 1 and only
+                                        // at the beginning
+                                        let _ = d.network_tx.send_blocking(0);
                                         is_handshake_msg = true;
                                     }
                                 }
@@ -956,6 +959,7 @@ impl Device {
                         }
                         // Notify the encrypt part with channel!!
                         if !is_handshake_msg {
+                            // tracing::info!("NEW");
                             let _ = d.encyrpt_tx.send_blocking(unsafe { IFACE_ITER });
                             if unsafe { IFACE_ITER != (RB_SIZE - 1) } {
                                 unsafe { IFACE_ITER += 1 };
@@ -975,15 +979,15 @@ impl Device {
     }
 }
 
-fn send_to_tunnel(tunnel_rx: Receiver<()>, iface: Arc<TunSocket>) {
-    while tunnel_rx.recv_blocking().is_ok() {
-        if let Some(elem) = unsafe { DECRYPTED_RING_BUFFER.pop_back() } {
+fn send_to_tunnel(tunnel_rx: Receiver<usize>, iface: Arc<TunSocket>) {
+    while let Ok(i) = tunnel_rx.recv_blocking() {
+        if let Some(elem) = unsafe { DECRYPTED_RING_BUFFER.get(i) } {
             {
                 let msg = elem.lock();
                 match &msg.res {
                     NeptunResult::Done => {}
                     NeptunResult::Err(e) => {
-                        tracing::error!(message = "Encapsulate error", error = ?e)
+                        tracing::error!(message = "Decapsulate error", error = ?e)
                     }
                     NeptunResult::WriteToTunnelV4(buf_len, addr) => {
                         if msg.peer.as_ref().unwrap().is_allowed_ip(*addr) {
@@ -998,16 +1002,13 @@ fn send_to_tunnel(tunnel_rx: Receiver<()>, iface: Arc<TunSocket>) {
                     _ => panic!("Unexpected result from encapsulate"),
                 };
             }
-            unsafe {
-                DECRYPTED_RING_BUFFER.push_front(elem);
-            }
         }
     }
 }
 
-fn send_to_network(network_rx: Receiver<()>, udp4: Arc<Socket>, udp6: Arc<Socket>) {
-    while network_rx.recv_blocking().is_ok() {
-        if let Some(elem) = unsafe { ENCRYPTED_RING_BUFFER.pop_back() } {
+fn send_to_network(network_rx: Receiver<usize>, udp4: Arc<Socket>, udp6: Arc<Socket>) {
+    while let Ok(i) = network_rx.recv_blocking() {
+        if let Some(elem) = unsafe { ENCRYPTED_RING_BUFFER.get(i) } {
             {
                 let msg = elem.lock();
                 match &msg.res {
@@ -1031,9 +1032,6 @@ fn send_to_network(network_rx: Receiver<()>, udp4: Arc<Socket>, udp6: Arc<Socket
                     }
                     _ => panic!("Unexpected result from encapsulate"),
                 };
-            }
-            unsafe {
-                ENCRYPTED_RING_BUFFER.push_front(elem);
             }
         }
     }

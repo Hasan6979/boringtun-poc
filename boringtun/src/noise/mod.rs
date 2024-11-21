@@ -62,7 +62,7 @@ impl<'a> From<WireGuardError> for TunnResult<'a> {
 /// Tunnel represents a point-to-point WireGuard connection
 pub struct Tunn {
     /// The handshake currently in progress
-    handshake: Mutex<handshake::Handshake>,
+    handshake: RwLock<handshake::Handshake>,
     /// The N_SESSIONS most recent sessions, index is session id modulo N_SESSIONS
     sessions: RwLock<[Option<session::Session>; N_SESSIONS]>,
     /// Index of most recently used session
@@ -166,7 +166,7 @@ impl Tunn {
     }
 
     pub fn is_expired(&self) -> bool {
-        let handshake = self.handshake.lock();
+        let handshake = self.handshake.read();
         handshake.is_expired()
     }
 
@@ -206,7 +206,7 @@ impl Tunn {
         let static_public = x25519::PublicKey::from(&static_private);
 
         Tunn {
-            handshake: Mutex::new(Handshake::new(
+            handshake: RwLock::new(Handshake::new(
                 static_private,
                 static_public,
                 peer_static_public,
@@ -240,7 +240,7 @@ impl Tunn {
             Arc::new(RateLimiter::new(&static_public, PEER_HANDSHAKE_RATE_LIMIT))
         });
         {
-            let mut handshake = self.handshake.lock();
+            let mut handshake = self.handshake.write();
             handshake.set_static_private(static_private, static_public);
         }
         self.clear_sessions();
@@ -259,10 +259,10 @@ impl Tunn {
             let packet = session.format_packet_data(src, dst);
             // TODO: Update timers by just setting dirty bit here
             // and updating it in the update_timers worker
-            self.timer_tick(TimerName::TimeLastPacketSent);
+            // self.timer_tick(TimerName::TimeLastPacketSent);
             // Exclude Keepalive packets from timer update.
             if !src.is_empty() {
-                self.timer_tick(TimerName::TimeLastDataPacketSent);
+                // self.timer_tick(TimerName::TimeLastDataPacketSent);
             }
             self.tx_bytes.fetch_add(src.len(), Ordering::Relaxed);
             return TunnResult::WriteToNetwork(packet);
@@ -335,7 +335,7 @@ impl Tunn {
 
         let (packet, session) = self
             .handshake
-            .lock()
+            .write()
             .receive_handshake_initialization(p, dst)?;
 
         // Store new session in ring buffer
@@ -361,7 +361,7 @@ impl Tunn {
             local_idx = p.receiver_idx,
             remote_idx = p.sender_idx
         );
-        let session = self.handshake.lock().receive_handshake_response(p)?;
+        let session = { self.handshake.write().receive_handshake_response(p)? };
 
         let keepalive_packet = session.format_packet_data(&[], dst);
         // Store new session in ring buffer
@@ -387,7 +387,7 @@ impl Tunn {
             local_idx = p.receiver_idx
         );
 
-        self.handshake.lock().receive_cookie_reply(p)?;
+        self.handshake.write().receive_cookie_reply(p)?;
         self.timer_tick(TimerName::TimeLastPacketReceived);
         self.timer_tick(TimerName::TimeCookieReceived);
 
@@ -435,7 +435,7 @@ impl Tunn {
 
         self.set_current_session(r_idx);
 
-        self.timer_tick(TimerName::TimeLastPacketReceived);
+        // self.timer_tick(TimerName::TimeLastPacketReceived);
 
         Ok(self.validate_decapsulated_packet(decapsulated_packet))
     }
@@ -447,18 +447,17 @@ impl Tunn {
         dst: &'a mut [u8],
         force_resend: bool,
     ) -> TunnResult<'a> {
-        let mut handshake = self.handshake.lock();
-        if handshake.is_in_progress() && !force_resend {
+        if self.handshake.read().is_in_progress() && !force_resend {
             return TunnResult::Done;
         }
 
-        if handshake.is_expired() {
+        if self.handshake.read().is_expired() {
             self.timers.lock().clear();
         }
 
-        let starting_new_handshake = !handshake.is_in_progress();
+        let starting_new_handshake = !self.handshake.read().is_in_progress();
 
-        match handshake.format_handshake_initiation(dst) {
+        match self.handshake.write().format_handshake_initiation(dst) {
             Ok(packet) => {
                 tracing::debug!("Sending handshake_initiation");
 
@@ -511,7 +510,7 @@ impl Tunn {
             return TunnResult::Err(WireGuardError::InvalidPacket);
         }
 
-        self.timer_tick(TimerName::TimeLastDataPacketReceived);
+        // self.timer_tick(TimerName::TimeLastDataPacketReceived);
         self.rx_bytes.fetch_add(computed_len, Ordering::Relaxed);
 
         match src_ip_address {
@@ -598,7 +597,7 @@ impl Tunn {
         let tx_bytes = self.tx_bytes.load(Ordering::Relaxed);
         let rx_bytes = self.rx_bytes.load(Ordering::Relaxed);
         let loss = self.estimate_loss();
-        let rtt = { self.handshake.lock().last_rtt };
+        let rtt = { self.handshake.read().last_rtt };
 
         (time, tx_bytes, rx_bytes, loss, rtt)
     }

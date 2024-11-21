@@ -111,25 +111,35 @@ impl IndexMut<TimerName> for Timers {
 impl Tunn {
     pub(super) fn timer_tick(&self, timer_name: TimerName) {
         // TODO: This entire function is to be revamped with dirty bit trick
-        // match timer_name {
-        //     TimeLastPacketReceived => {
-        //         self.timers.want_keepalive = true;
-        //         self.timers.want_handshake = false;
-        //     }
-        //     TimeLastPacketSent => {
-        //         self.timers.want_handshake = true;
-        //         self.timers.want_keepalive = false;
-        //     }
-        //     _ => {}
-        // }
+        let mut timers = if let Some(t) = self.timers.try_lock() {
+            t
+        } else {
+            return;
+        };
 
-        // let time = self.timers[TimeCurrent];
-        // self.timers[timer_name] = time;
+        match timer_name {
+            TimeLastPacketReceived => {
+                timers.want_keepalive = true;
+                timers.want_handshake = false;
+            }
+            TimeLastPacketSent => {
+                timers.want_handshake = true;
+                timers.want_keepalive = false;
+            }
+            _ => {}
+        }
+
+        let time = timers[TimeCurrent];
+        timers[timer_name] = time;
     }
 
     pub(super) fn timer_tick_session_established(&self, is_initiator: bool, session_idx: usize) {
         // Called only part of handshake, so okay to lock it.
-        let mut timers = self.timers.lock();
+        let mut timers = if let Some(t) = self.timers.try_lock() {
+            t
+        } else {
+            return;
+        };
         self.timer_tick(TimeSessionEstablished);
         timers.session_timers[session_idx % crate::noise::N_SESSIONS] = timers[TimeCurrent];
         timers.is_initiator = is_initiator;
@@ -170,7 +180,11 @@ impl Tunn {
     }
 
     pub fn update_timers<'a>(&self, dst: &'a mut [u8]) -> TunnResult<'a> {
-        let mut timers = self.timers.lock();
+        let mut timers = if let Some(t) = self.timers.try_lock() {
+            t
+        } else {
+            return TunnResult::Done;
+        };
         let mut handshake_initiation_required = false;
         let mut keepalive_required = false;
 
@@ -197,28 +211,27 @@ impl Tunn {
         let persistent_keepalive = timers.persistent_keepalive;
 
         {
-            let mut handshake = self.handshake.lock();
-            if handshake.is_expired() {
+            if self.handshake.read().is_expired() {
                 return TunnResult::Err(WireGuardError::ConnectionExpired);
             }
 
             // Clear cookie after COOKIE_EXPIRATION_TIME
-            if handshake.has_cookie() && now - timers[TimeCookieReceived] >= COOKIE_EXPIRATION_TIME
+            if self.handshake.read().has_cookie()
+                && now - timers[TimeCookieReceived] >= COOKIE_EXPIRATION_TIME
             {
-                handshake.clear_cookie();
+                // self.handshake.write().clear_cookie();
             }
 
             // All ephemeral private keys and symmetric session keys are zeroed out after
             // (REJECT_AFTER_TIME * 3) ms if no new keys have been exchanged.
             if now - session_established >= REJECT_AFTER_TIME * 3 {
                 tracing::error!("CONNECTION_EXPIRED(REJECT_AFTER_TIME * 3)");
-                handshake.set_expired();
-                drop(handshake);
+                self.handshake.write().set_expired();
                 self.clear_all();
                 return TunnResult::Err(WireGuardError::ConnectionExpired);
             }
 
-            if let Some(time_init_sent) = handshake.timer() {
+            if let Some(time_init_sent) = self.handshake.read().timer() {
                 // Handshake Initiation Retransmission
                 if now - handshake_started >= REKEY_ATTEMPT_TIME {
                     // After REKEY_ATTEMPT_TIME ms of trying to initiate a new handshake,
@@ -226,8 +239,7 @@ impl Tunn {
                     // up to be sent. If a packet is explicitly queued up to be sent, then
                     // this timer is reset.
                     tracing::error!("CONNECTION_EXPIRED(REKEY_ATTEMPT_TIME)");
-                    handshake.set_expired();
-                    drop(handshake);
+                    // self.handshake.write().set_expired();
                     self.clear_all();
                     return TunnResult::Err(WireGuardError::ConnectionExpired);
                 }
@@ -243,7 +255,6 @@ impl Tunn {
                 }
             } else {
                 // Borrow checker complains about double mutable borrow
-                drop(handshake);
                 if timers.is_initiator() {
                     // After sending a packet, if the sender was the original initiator
                     // of the handshake and if the current session key is REKEY_AFTER_TIME

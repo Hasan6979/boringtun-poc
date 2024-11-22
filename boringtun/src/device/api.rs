@@ -170,7 +170,7 @@ fn api_get(writer: &mut BufWriter<&UnixStream>, d: &Device) -> i32 {
 
     for (k, peer) in d.peers.iter() {
         let (keepalive, last_handshake_time, stats) = {
-            let tun = peer.tunnel.lock();
+            let tun = &peer.tunnel;
             (
                 tun.persistent_keepalive(),
                 tun.last_handshake_time(),

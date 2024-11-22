@@ -463,7 +463,7 @@ impl Device {
         let rate_limiter = Arc::new(RateLimiter::new(&public_key, HANDSHAKE_RATE_LIMIT));
 
         for peer in self.peers.values_mut() {
-            peer.tunnel.lock().set_static_private(
+            peer.tunnel.set_static_private(
                 private_key.clone(),
                 public_key,
                 Some(Arc::clone(&rate_limiter)),
@@ -548,7 +548,7 @@ impl Device {
                     };
 
                     let res = {
-                        let mut tun = peer.tunnel.lock();
+                        let tun = &peer.tunnel;
                         tun.update_timers(&mut t.dst_buf[..])
                     };
                     match res {
@@ -645,7 +645,7 @@ impl Device {
                     // We found a peer, use it to decapsulate the message+
                     let mut flush = false; // Are there packets to send from the queue?
                     let res = {
-                        let mut tun = peer.tunnel.lock();
+                        let tun = &peer.tunnel;
                         tun.handle_verified_packet(parsed_packet, &mut t.dst_buf[..])
                     };
                     match res {
@@ -671,7 +671,7 @@ impl Device {
                         // Flush pending queue
                         loop {
                             let res = {
-                                let mut tun = peer.tunnel.lock();
+                                let tun = &peer.tunnel;
                                 tun.decapsulate(None, &[], &mut t.dst_buf[..])
                             };
 
@@ -730,7 +730,7 @@ impl Device {
                 while let Ok(read_bytes) = udp.recv(src_buf) {
                     let mut flush = false;
                     let res = {
-                        let mut tun = peer.tunnel.lock();
+                        let tun = &peer.tunnel;
                         tun.decapsulate(
                             Some(peer_addr),
                             &t.src_buf[..read_bytes],
@@ -761,7 +761,7 @@ impl Device {
                         // Flush pending queue
                         loop {
                             let res = {
-                                let mut tun = peer.tunnel.lock();
+                                let tun = &peer.tunnel;
                                 tun.decapsulate(None, &[], &mut t.dst_buf[..])
                             };
 
@@ -828,7 +828,7 @@ impl Device {
                     };
 
                     let res = {
-                        let mut tun = peer.tunnel.lock();
+                        let tun = &peer.tunnel;
                         tun.encapsulate(src, &mut t.dst_buf[..])
                     };
                     match res {

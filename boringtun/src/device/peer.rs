@@ -17,7 +17,7 @@ pub struct Endpoint {
 }
 
 pub struct Peer {
-    pub(crate) tunnel: Mutex<Tunn>,
+    pub(crate) tunnel: Tunn,
     /// The index the tunnel uses
     index: u32,
     endpoint: RwLock<Endpoint>,
@@ -58,7 +58,7 @@ impl Peer {
         preshared_key: Option<[u8; 32]>,
     ) -> Peer {
         Peer {
-            tunnel: Mutex::new(tunnel),
+            tunnel,
             index,
             endpoint: RwLock::new(Endpoint {
                 addr: endpoint,

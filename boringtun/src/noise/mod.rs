@@ -70,7 +70,7 @@ pub struct Tunn {
     /// Queue to store blocked packets
     packet_queue: Mutex<VecDeque<Vec<u8>>>,
     /// Keeps tabs on the expiring timers
-    timers: Mutex<timers::Timers>,
+    timers: timers::Timers,
     tx_bytes: AtomicUsize,
     rx_bytes: AtomicUsize,
     rate_limiter: RwLock<Arc<RateLimiter>>,
@@ -219,7 +219,7 @@ impl Tunn {
             rx_bytes: Default::default(),
 
             packet_queue: Mutex::new(VecDeque::new()),
-            timers: Mutex::new(Timers::new(persistent_keepalive, rate_limiter.is_none())),
+            timers: Timers::new(persistent_keepalive, rate_limiter.is_none()),
 
             rate_limiter: RwLock::new(rate_limiter.unwrap_or_else(|| {
                 Arc::new(RateLimiter::new(&static_public, PEER_HANDSHAKE_RATE_LIMIT))
@@ -234,8 +234,9 @@ impl Tunn {
         static_public: x25519::PublicKey,
         rate_limiter: Option<Arc<RateLimiter>>,
     ) {
-        self.timers.lock().should_reset_rr = rate_limiter.is_none();
-        // let m_rate_limiter = self.rate_limiter.write();
+        self.timers
+            .should_reset_rr
+            .store(rate_limiter.is_none(), Ordering::Relaxed);
         *(self.rate_limiter.write()) = rate_limiter.unwrap_or_else(|| {
             Arc::new(RateLimiter::new(&static_public, PEER_HANDSHAKE_RATE_LIMIT))
         });
@@ -261,9 +262,9 @@ impl Tunn {
             // and updating it in the update_timers worker
             // self.timer_tick(TimerName::TimeLastPacketSent);
             // Exclude Keepalive packets from timer update.
-            if !src.is_empty() {
-                // self.timer_tick(TimerName::TimeLastDataPacketSent);
-            }
+            // if !src.is_empty() {
+            // self.timer_tick(TimerName::TimeLastDataPacketSent);
+            // }
             self.tx_bytes.fetch_add(src.len(), Ordering::Relaxed);
             return TunnResult::WriteToNetwork(packet);
         }
@@ -405,8 +406,8 @@ impl Tunn {
         }
         if self.sessions.write()[cur_idx % N_SESSIONS].is_none()
             // It is okay to lock timers here, because not part of the hot path
-            || self.timers.lock().session_timers[new_idx % N_SESSIONS]
-                >= self.timers.lock().session_timers[cur_idx % N_SESSIONS]
+            || self.timers.session_timers[new_idx % N_SESSIONS].time()
+                >= self.timers.session_timers[cur_idx % N_SESSIONS].time()
         {
             self.current.store(new_idx, Ordering::Relaxed);
             tracing::debug!(message = "New session", session = new_idx);
@@ -452,7 +453,7 @@ impl Tunn {
         }
 
         if self.handshake.read().is_expired() {
-            self.timers.lock().clear();
+            self.timers.clear();
         }
 
         let starting_new_handshake = !self.handshake.read().is_in_progress();

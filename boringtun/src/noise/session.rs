@@ -9,7 +9,7 @@ use super::{
     NeptunResult, PacketData, Tunn,
 };
 use crate::noise::errors::WireGuardError;
-use async_channel::{Receiver, Sender};
+use crossbeam::channel::{Receiver, Sender};
 use parking_lot::Mutex;
 use ring::aead::{Aad, LessSafeKey, Nonce, UnboundKey, CHACHA20_POLY1305};
 use std::{
@@ -219,23 +219,23 @@ impl Session {
         encrypt_rx: Receiver<&EncryptionTaskData>,
         network_tx: Sender<&NetworkTaskData>,
     ) {
-        while let Ok(src) = encrypt_rx.recv_blocking() {
-            let dst = unsafe { &mut ENCRYPTED_RING_BUFFER[ENCRYPT_ITER] };
-            if dst.is_element_free.load(Ordering::Relaxed) {
-                let data_len = src.buf_len;
+        while let Ok(encryption_data) = encrypt_rx.recv() {
+            let network_data = unsafe { &mut ENCRYPTED_RING_BUFFER[ENCRYPT_ITER] };
+            if network_data.is_element_free.load(Ordering::Relaxed) {
+                let data_len = encryption_data.buf_len;
                 let (_, data_len) = Session::encrypt_data_pkt(
-                    src.sending_key_counter.clone(),
-                    src.sending_index,
-                    src.sender.as_ref().unwrap().clone(),
-                    &src.data.as_slice()[..data_len],
-                    dst.data.as_mut_slice(),
+                    encryption_data.sending_key_counter.clone(),
+                    encryption_data.sending_index,
+                    encryption_data.sender.as_ref().unwrap().clone(),
+                    &encryption_data.data.as_slice()[..data_len],
+                    network_data.data.as_mut_slice(),
                 );
-                dst.peer = Some(src.peer.as_ref().unwrap().clone());
-                dst.buf_len = data_len;
-                dst.res = NeptunResult::WriteToNetwork(data_len);
+                network_data.peer = Some(encryption_data.peer.as_ref().unwrap().clone());
+                network_data.buf_len = data_len;
+                network_data.res = NeptunResult::WriteToNetwork(data_len);
 
-                dst.is_element_free.store(false, Ordering::Relaxed);
-                let _ = network_tx.send_blocking(dst);
+                network_data.is_element_free.store(false, Ordering::Relaxed);
+                let _ = network_tx.send(network_data);
             }
             if unsafe { ENCRYPT_ITER != (RB_SIZE - 1) } {
                 unsafe { ENCRYPT_ITER += 1 };
@@ -243,7 +243,9 @@ impl Session {
                 // Reset the write iterator
                 unsafe { ENCRYPT_ITER = 0 };
             }
-            src.is_element_free.store(true, Ordering::Relaxed);
+            encryption_data
+                .is_element_free
+                .store(true, Ordering::Relaxed);
         }
     }
 
@@ -296,31 +298,33 @@ impl Session {
         decrypt_rx: Receiver<&DecryptionTaskData>,
         tunnel_tx: Sender<&NetworkTaskData>,
     ) {
-        while let Ok(src) = decrypt_rx.recv_blocking() {
-            let dst = unsafe { &mut DECRYPTED_RING_BUFFER[DECRYPT_ITER] };
-            if dst.is_element_free.load(Ordering::Relaxed) {
-                let data_len = src.buf_len;
+        while let Ok(decryption_data) = decrypt_rx.recv() {
+            let network_data = unsafe { &mut DECRYPTED_RING_BUFFER[DECRYPT_ITER] };
+            if network_data.is_element_free.load(Ordering::Relaxed) {
+                let data_len = decryption_data.buf_len;
                 let decapsulated_packet = Session::decrypt_data_pkt(
                     PacketData {
-                        receiver_idx: u32::from_le_bytes(src.data[4..8].try_into().unwrap()),
-                        counter: src.counter,
-                        encrypted_encapsulated_packet: &src.data[16..data_len],
+                        receiver_idx: u32::from_le_bytes(
+                            decryption_data.data[4..8].try_into().unwrap(),
+                        ),
+                        counter: decryption_data.counter,
+                        encrypted_encapsulated_packet: &decryption_data.data[16..data_len],
                     },
-                    src.receiving_index,
-                    src.receiver.as_ref().unwrap().clone(),
-                    src.receiving_key_counter.clone(),
-                    dst.data.as_mut_slice(),
+                    decryption_data.receiving_index,
+                    decryption_data.receiver.as_ref().unwrap().clone(),
+                    decryption_data.receiving_key_counter.clone(),
+                    network_data.data.as_mut_slice(),
                 );
-                dst.res = match decapsulated_packet {
-                    Ok(len) => {
-                        Tunn::validate_decapsulated_packet(&mut dst.data.as_mut_slice()[..len])
-                    }
+                network_data.res = match decapsulated_packet {
+                    Ok(len) => Tunn::validate_decapsulated_packet(
+                        &mut network_data.data.as_mut_slice()[..len],
+                    ),
                     Err(e) => NeptunResult::Err(e),
                 };
-                dst.peer = Some(src.peer.as_ref().unwrap().clone());
+                network_data.peer = Some(decryption_data.peer.as_ref().unwrap().clone());
 
-                dst.is_element_free.store(false, Ordering::Relaxed);
-                let _ = tunnel_tx.send_blocking(dst);
+                network_data.is_element_free.store(false, Ordering::Relaxed);
+                let _ = tunnel_tx.send(network_data);
 
                 if unsafe { DECRYPT_ITER != (RB_SIZE - 1) } {
                     unsafe { DECRYPT_ITER += 1 };
@@ -328,7 +332,9 @@ impl Session {
                     // Reset the write iterator
                     unsafe { DECRYPT_ITER = 0 };
                 }
-                src.is_element_free.store(true, Ordering::Relaxed);
+                decryption_data
+                    .is_element_free
+                    .store(true, Ordering::Relaxed);
             }
         }
     }
@@ -391,8 +397,8 @@ mod tests {
         let peer_index = 1;
         let receiving_key = [1; 32];
         let sending_key = [2; 32];
-        let (tx, rx) = async_channel::bounded(10);
-        let (tx1, rx1) = async_channel::bounded(10);
+        let (tx, rx) = crossbeam::channel::bounded(10);
+        let (tx1, rx1) = crossbeam::channel::bounded(10);
         let session = Session::new(local_index, peer_index, receiving_key, sending_key);
 
         let rx_clone = rx.clone();
@@ -411,9 +417,9 @@ mod tests {
                 println!("data {:?}", &item.data[..item.buf_len]);
                 item.sending_key_counter = session.sending_key_counter.clone();
             }
-            let _ = tx.send_blocking(item);
+            let _ = tx.send(item);
         }
-        if rx1.recv_blocking().is_ok() {
+        if rx1.recv().is_ok() {
             if let Some(en_msg) = unsafe { ENCRYPTED_RING_BUFFER.pop_back() } {
                 let src = &en_msg.data[..en_msg.buf_len];
                 println!("encrypted data {:?}", src);

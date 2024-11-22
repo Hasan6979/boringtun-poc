@@ -47,7 +47,7 @@ use crate::noise::session::Session;
 use crate::noise::{NeptunResult, Packet, Tunn, TunnResult};
 use crate::x25519;
 use allowed_ips::AllowedIps;
-use async_channel::{Receiver, Sender};
+use crossbeam::channel::{Sender, Receiver};
 use once_cell::sync::Lazy;
 use peer::{AllowedIP, Peer};
 use poll::{EventPoll, EventRef, WaitResult};
@@ -380,11 +380,11 @@ impl Device {
         let uapi_fd = -1;
         #[cfg(target_os = "linux")]
         let uapi_fd = config.uapi_fd;
-        let (encyrpt_tx, encrypt_rx) = async_channel::bounded(RB_SIZE);
-        let (network_tx, network_rx) = async_channel::bounded(RB_SIZE);
+        let (encyrpt_tx, encrypt_rx) = crossbeam::channel::bounded(RB_SIZE);
+        let (network_tx, network_rx) = crossbeam::channel::bounded(RB_SIZE);
 
-        let (decyrpt_tx, decrypt_rx) = async_channel::bounded(RB_SIZE);
-        let (tunnel_tx, tunnel_rx) = async_channel::bounded(RB_SIZE);
+        let (decyrpt_tx, decrypt_rx) = crossbeam::channel::bounded(RB_SIZE);
+        let (tunnel_tx, tunnel_rx) = crossbeam::channel::bounded(RB_SIZE);
 
         let mut device = Device {
             queue: Arc::new(poll),
@@ -713,7 +713,7 @@ impl Device {
                                         element.peer = Some(peer.clone());
                                         tun.set_current_session(r_idx);
                                         element.is_element_free.store(false, Ordering::Relaxed);
-                                        let _ = d.decyrpt_tx.send_blocking(element);
+                                        let _ = d.decyrpt_tx.send(element);
                                         if unsafe { TUN_ITER != (RB_SIZE - 1) } {
                                             unsafe { TUN_ITER += 1 };
                                         } else {
@@ -953,7 +953,7 @@ impl Device {
                                         // This has to change. Atm, can handle only 1 and only
                                         // at the beginning
                                         dst.is_element_free.store(false, Ordering::Relaxed);
-                                        let _ = d.network_tx.send_blocking(dst);
+                                        let _ = d.network_tx.send(dst);
                                         is_handshake_msg = true;
                                     }
                                 }
@@ -962,7 +962,7 @@ impl Device {
                         // Notify the encrypt part with channel!!
                         if !is_handshake_msg {
                             element.is_element_free.store(false, Ordering::Relaxed);
-                            let _ = d.encyrpt_tx.send_blocking(element);
+                            let _ = d.encyrpt_tx.send(element);
                             if unsafe { IFACE_ITER != (RB_SIZE - 1) } {
                                 unsafe { IFACE_ITER += 1 };
                             } else {
@@ -982,7 +982,7 @@ impl Device {
 }
 
 fn send_to_tunnel(tunnel_rx: Receiver<&NetworkTaskData>, iface: Arc<TunSocket>) {
-    while let Ok(msg) = tunnel_rx.recv_blocking() {
+    while let Ok(msg) = tunnel_rx.recv() {
         match &msg.res {
             NeptunResult::Done => {}
             NeptunResult::Err(e) => {
@@ -1005,7 +1005,7 @@ fn send_to_tunnel(tunnel_rx: Receiver<&NetworkTaskData>, iface: Arc<TunSocket>) 
 }
 
 fn send_to_network(network_rx: Receiver<&NetworkTaskData>, udp4: Arc<Socket>, udp6: Arc<Socket>) {
-    while let Ok(msg) = network_rx.recv_blocking() {
+    while let Ok(msg) = network_rx.recv() {
         match &msg.res {
             NeptunResult::Done => {}
             NeptunResult::Err(e) => {

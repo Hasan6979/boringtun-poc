@@ -47,7 +47,7 @@ use crate::noise::session::Session;
 use crate::noise::{NeptunResult, Packet, Tunn, TunnResult};
 use crate::x25519;
 use allowed_ips::AllowedIps;
-use crossbeam::channel::{Sender, Receiver};
+use crossbeam::channel::{Receiver, Sender};
 use once_cell::sync::Lazy;
 use peer::{AllowedIP, Peer};
 use poll::{EventPoll, EventRef, WaitResult};

@@ -336,7 +336,7 @@ impl Tunn {
             Packet::HandshakeInit(p) => self.handle_handshake_init(p, dst),
             Packet::HandshakeResponse(p) => self.handle_handshake_response(p, dst),
             Packet::PacketCookieReply(p) => self.handle_cookie_reply(p),
-            Packet::PacketData(p) => Ok(TunnResult::Done),
+            _ => Ok(TunnResult::Done),
         }
         .unwrap_or_else(TunnResult::from)
     }
@@ -471,9 +471,9 @@ impl Tunn {
 
     /// Formats a new handshake initiation message and store it in dst. If force_resend is true will send
     /// a new handshake, even if a handshake is already in progress (for example when a handshake times out)
-    pub fn format_handshake_initiation<'a>(
+    pub fn format_handshake_initiation(
         &mut self,
-        dst: &'a mut [u8],
+        dst: &mut [u8],
         force_resend: bool,
     ) -> NeptunResult {
         if self.handshake.is_in_progress() && !force_resend {
@@ -502,7 +502,7 @@ impl Tunn {
 
     /// Check if an IP packet is v4 or v6, truncate to the length indicated by the length field
     /// Returns the truncated packet and the source IP as TunnResult
-    fn validate_decapsulated_packet<'a>(packet: &'a mut [u8]) -> NeptunResult {
+    fn validate_decapsulated_packet(packet: &mut [u8]) -> NeptunResult {
         let (computed_len, src_ip_address) = match packet.len() {
             0 => return NeptunResult::Done, // This is keepalive, and not an error
             _ if packet[0] >> 4 == 4 && packet.len() >= IPV4_MIN_HEADER_SIZE => {

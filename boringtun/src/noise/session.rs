@@ -4,7 +4,7 @@
 use super::{
     ring_buffers::{
         DecryptionTaskData, EncryptionTaskData, NetworkTaskData, DECRYPTED_RING_BUFFER,
-        ENCRYPTED_RING_BUFFER, PLAINTEXT_RING_BUFFER, RB_SIZE, RX_RING_BUFFER,
+        ENCRYPTED_RING_BUFFER, PLAINTEXT_RING_BUFFER, RB_SIZE,
     },
     NeptunResult, PacketData, Tunn,
 };
@@ -18,7 +18,6 @@ use std::{
         atomic::{AtomicUsize, Ordering},
         Arc,
     },
-    time::Instant,
 };
 
 pub struct Session {
@@ -221,21 +220,24 @@ impl Session {
     ) {
         while let Ok(encryption_data) = encrypt_rx.recv() {
             let network_data = unsafe { &mut ENCRYPTED_RING_BUFFER[ENCRYPT_ITER] };
-            if network_data.is_element_free.load(Ordering::Relaxed) {
-                let data_len = encryption_data.buf_len;
-                let (_, data_len) = Session::encrypt_data_pkt(
-                    encryption_data.sending_key_counter.clone(),
-                    encryption_data.sending_index,
-                    encryption_data.sender.as_ref().unwrap().clone(),
-                    &encryption_data.data.as_slice()[..data_len],
-                    network_data.data.as_mut_slice(),
-                );
-                network_data.peer = Some(encryption_data.peer.as_ref().unwrap().clone());
-                network_data.buf_len = data_len;
-                network_data.res = NeptunResult::WriteToNetwork(data_len);
+            loop {
+                if network_data.is_element_free.load(Ordering::Relaxed) {
+                    let data_len = encryption_data.buf_len;
+                    let (_, data_len) = Session::encrypt_data_pkt(
+                        encryption_data.sending_key_counter.clone(),
+                        encryption_data.sending_index,
+                        encryption_data.sender.as_ref().unwrap().clone(),
+                        &encryption_data.data.as_slice()[..data_len],
+                        network_data.data.as_mut_slice(),
+                    );
+                    network_data.peer = Some(encryption_data.peer.as_ref().unwrap().clone());
+                    network_data.buf_len = data_len;
+                    network_data.res = NeptunResult::WriteToNetwork(data_len);
 
-                network_data.is_element_free.store(false, Ordering::Relaxed);
-                let _ = network_tx.send(network_data);
+                    network_data.is_element_free.store(false, Ordering::Relaxed);
+                    let _ = network_tx.send(network_data);
+                    break;
+                }
             }
             if unsafe { ENCRYPT_ITER != (RB_SIZE - 1) } {
                 unsafe { ENCRYPT_ITER += 1 };
@@ -300,41 +302,42 @@ impl Session {
     ) {
         while let Ok(decryption_data) = decrypt_rx.recv() {
             let network_data = unsafe { &mut DECRYPTED_RING_BUFFER[DECRYPT_ITER] };
-            if network_data.is_element_free.load(Ordering::Relaxed) {
-                let data_len = decryption_data.buf_len;
-                let decapsulated_packet = Session::decrypt_data_pkt(
-                    PacketData {
-                        receiver_idx: u32::from_le_bytes(
-                            decryption_data.data[4..8].try_into().unwrap(),
+            loop {
+                if network_data.is_element_free.load(Ordering::Relaxed) {
+                    let data_len = decryption_data.buf_len;
+                    let decapsulated_packet = Session::decrypt_data_pkt(
+                        PacketData {
+                            receiver_idx: u32::from_le_bytes(
+                                decryption_data.data[4..8].try_into().unwrap(),
+                            ),
+                            counter: decryption_data.counter,
+                            encrypted_encapsulated_packet: &decryption_data.data[16..data_len],
+                        },
+                        decryption_data.receiving_index,
+                        decryption_data.receiver.as_ref().unwrap().clone(),
+                        decryption_data.receiving_key_counter.clone(),
+                        network_data.data.as_mut_slice(),
+                    );
+                    network_data.res = match decapsulated_packet {
+                        Ok(len) => Tunn::validate_decapsulated_packet(
+                            &mut network_data.data.as_mut_slice()[..len],
                         ),
-                        counter: decryption_data.counter,
-                        encrypted_encapsulated_packet: &decryption_data.data[16..data_len],
-                    },
-                    decryption_data.receiving_index,
-                    decryption_data.receiver.as_ref().unwrap().clone(),
-                    decryption_data.receiving_key_counter.clone(),
-                    network_data.data.as_mut_slice(),
-                );
-                network_data.res = match decapsulated_packet {
-                    Ok(len) => Tunn::validate_decapsulated_packet(
-                        &mut network_data.data.as_mut_slice()[..len],
-                    ),
-                    Err(e) => NeptunResult::Err(e),
-                };
-                network_data.peer = Some(decryption_data.peer.as_ref().unwrap().clone());
-
-                network_data.is_element_free.store(false, Ordering::Relaxed);
-                let _ = tunnel_tx.send(network_data);
-
-                if unsafe { DECRYPT_ITER != (RB_SIZE - 1) } {
-                    unsafe { DECRYPT_ITER += 1 };
-                } else {
-                    // Reset the write iterator
-                    unsafe { DECRYPT_ITER = 0 };
+                        Err(e) => NeptunResult::Err(e),
+                    };
+                    network_data.peer = Some(decryption_data.peer.as_ref().unwrap().clone());
+                    if unsafe { DECRYPT_ITER != (RB_SIZE - 1) } {
+                        unsafe { DECRYPT_ITER += 1 };
+                    } else {
+                        // Reset the write iterator
+                        unsafe { DECRYPT_ITER = 0 };
+                    }
+                    decryption_data
+                        .is_element_free
+                        .store(true, Ordering::Relaxed);
+                    network_data.is_element_free.store(false, Ordering::Relaxed);
+                    let _ = tunnel_tx.send(network_data);
+                    break;
                 }
-                decryption_data
-                    .is_element_free
-                    .store(true, Ordering::Relaxed);
             }
         }
     }
@@ -343,12 +346,12 @@ impl Session {
     /// dst - pre-allocated space to hold the encapsulated IP packet, to send to the interface
     ///       dst will always take less space than src
     /// return the size of the encapsulated packet on success
-    pub fn decrypt_data_pkt<'a>(
+    pub fn decrypt_data_pkt(
         packet: PacketData,
         receiving_index: u32,
         receiver: Arc<LessSafeKey>,
         receiving_key_counter: Arc<Mutex<ReceivingKeyCounterValidator>>,
-        dst: &'a mut [u8],
+        dst: &mut [u8],
     ) -> Result<usize, WireGuardError> {
         let ct_len = packet.encrypted_encapsulated_packet.len();
         if dst.len() < ct_len {

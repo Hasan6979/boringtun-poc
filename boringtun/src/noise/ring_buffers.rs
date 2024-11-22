@@ -1,4 +1,4 @@
-use super::{session::ReceivingKeyCounterValidator, NeptunResult, PacketData};
+use super::{session::ReceivingKeyCounterValidator, NeptunResult};
 use crate::device::peer::Peer;
 use once_cell::sync::Lazy;
 use parking_lot::Mutex;

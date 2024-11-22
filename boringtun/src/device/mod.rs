@@ -44,6 +44,7 @@ use crate::noise::ring_buffers::{
     PLAINTEXT_RING_BUFFER, RB_SIZE, RX_RING_BUFFER,
 };
 use crate::noise::session::Session;
+use crate::noise::timers::TimerName;
 use crate::noise::{NeptunResult, Packet, Tunn, TunnResult};
 use crate::x25519;
 use allowed_ips::AllowedIps;
@@ -712,6 +713,7 @@ impl Device {
                                         element.receiving_key_counter = session.receiving_key_counter.clone();
                                         element.peer = Some(peer.clone());
                                         tun.set_current_session(r_idx);
+                                        tun.mark_timer_to_update(TimerName::TimeLastPacketReceived);
                                         element.is_element_free.store(false, Ordering::Relaxed);
                                         let _ = d.decyrpt_tx.send(element);
                                         if unsafe { TUN_ITER != (RB_SIZE - 1) } {
@@ -888,7 +890,6 @@ impl Device {
                 for _ in 0..MAX_ITR {
                     let element = unsafe { &mut PLAINTEXT_RING_BUFFER[IFACE_ITER] };
                     if element.is_element_free.load(Ordering::Relaxed) {
-                        let mut is_handshake_msg = false;
                         {
                             let src = match iface.read(&mut element.data[..mtu]) {
                                 Ok(src) => src,
@@ -928,8 +929,24 @@ impl Device {
                                     element.sending_key_counter =
                                         session.sending_key_counter.clone();
                                     element.peer = Some(peer.clone());
+                                    tun.mark_timer_to_update(TimerName::TimeLastPacketSent);
+                                    // Exclude Keepalive packets from timer update.
+                                    if !src.is_empty() {
+                                        tun.mark_timer_to_update(TimerName::TimeLastDataPacketSent);
+                                    }
+
+                                    element.is_element_free.store(false, Ordering::Relaxed);
+                                    let _ = d.encyrpt_tx.send(element);
+                                    if unsafe { IFACE_ITER != (RB_SIZE - 1) } {
+                                        unsafe { IFACE_ITER += 1 };
+                                    } else {
+                                        // Reset the write iterator
+                                        unsafe { IFACE_ITER = 0 };
+                                    }
                                     // Update the timers!
                                 } else {
+                                    // Q the packet
+                                    tun.queue_packet(src);
                                     // Initiate handshake
                                     // TODO: Have to fix this. This can't be a hardcoded 0th iter
                                     if let Some(dst) = unsafe { ENCRYPTED_RING_BUFFER.get_mut(0) } {
@@ -954,24 +971,10 @@ impl Device {
                                         // at the beginning
                                         dst.is_element_free.store(false, Ordering::Relaxed);
                                         let _ = d.network_tx.send(dst);
-                                        is_handshake_msg = true;
                                     }
                                 }
                             };
                         }
-                        // Notify the encrypt part with channel!!
-                        if !is_handshake_msg {
-                            element.is_element_free.store(false, Ordering::Relaxed);
-                            let _ = d.encyrpt_tx.send(element);
-                            if unsafe { IFACE_ITER != (RB_SIZE - 1) } {
-                                unsafe { IFACE_ITER += 1 };
-                            } else {
-                                // Reset the write iterator
-                                unsafe { IFACE_ITER = 0 };
-                            }
-                        }
-                        continue;
-                        // TODO: Q the packet
                     }
                 }
                 Action::Continue

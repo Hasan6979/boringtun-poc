@@ -324,6 +324,10 @@ impl Session {
                         ),
                         Err(e) => NeptunResult::Err(e),
                     };
+                    // TODO: Update the following here. in peer->tunnel
+                    // But can do that after removing the outer mutability on tunnel
+                    // self.timer_tick(TimerName::TimeLastDataPacketReceived);
+                    // self.rx_bytes += computed_len;
                     network_data.peer = Some(decryption_data.peer.as_ref().unwrap().clone());
                     if unsafe { DECRYPT_ITER != (RB_SIZE - 1) } {
                         unsafe { DECRYPT_ITER += 1 };

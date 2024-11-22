@@ -9,6 +9,7 @@ pub mod ring_buffers;
 pub mod session;
 pub mod timers;
 
+use parking_lot::Mutex;
 use session::Session;
 
 use crate::noise::errors::WireGuardError;
@@ -83,7 +84,7 @@ pub struct Tunn {
     /// Index of most recently used session
     pub current: usize,
     /// Queue to store blocked packets
-    packet_queue: VecDeque<Vec<u8>>,
+    packet_queue: Mutex<VecDeque<Vec<u8>>>,
     /// Keeps tabs on the expiring timers
     timers: timers::Timers,
     pub tx_bytes: usize,
@@ -232,7 +233,7 @@ impl Tunn {
             tx_bytes: Default::default(),
             rx_bytes: Default::default(),
 
-            packet_queue: VecDeque::new(),
+            packet_queue: Mutex::new(VecDeque::new()),
             timers: Timers::new(persistent_keepalive, rate_limiter.is_none()),
 
             rate_limiter: rate_limiter.unwrap_or_else(|| {
@@ -564,23 +565,26 @@ impl Tunn {
     // }
 
     /// Push packet to the back of the queue
-    fn queue_packet(&mut self, packet: &[u8]) {
-        if self.packet_queue.len() < MAX_QUEUE_DEPTH {
+    pub fn queue_packet(&self, packet: &[u8]) {
+        let mut queue = self.packet_queue.lock();
+        if queue.len() < MAX_QUEUE_DEPTH {
             // Drop if too many are already in queue
-            self.packet_queue.push_back(packet.to_vec());
+            queue.push_back(packet.to_vec());
         }
     }
 
     /// Push packet to the front of the queue
     fn requeue_packet(&mut self, packet: Vec<u8>) {
-        if self.packet_queue.len() < MAX_QUEUE_DEPTH {
+        let mut queue = self.packet_queue.lock();
+        if queue.len() < MAX_QUEUE_DEPTH {
             // Drop if too many are already in queue
-            self.packet_queue.push_front(packet);
+            queue.push_front(packet);
         }
     }
 
     fn dequeue_packet(&mut self) -> Option<Vec<u8>> {
-        self.packet_queue.pop_front()
+        let mut queue = self.packet_queue.lock();
+        queue.pop_front()
     }
 
     fn estimate_loss(&self) -> f32 {

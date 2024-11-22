@@ -6,6 +6,7 @@ use crate::noise::{Tunn, TunnResult};
 use std::mem;
 use std::ops::{Index, IndexMut};
 
+use std::sync::atomic::AtomicU16;
 use std::time::{Duration, SystemTime};
 
 #[cfg(feature = "mock-instant")]
@@ -23,7 +24,7 @@ pub(crate) const REKEY_TIMEOUT: Duration = Duration::from_secs(5);
 const KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(10);
 const COOKIE_EXPIRATION_TIME: Duration = Duration::from_secs(120);
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub enum TimerName {
     /// Current time, updated each call to `update_timers`
     TimeCurrent,
@@ -46,6 +47,20 @@ pub enum TimerName {
     Top,
 }
 
+impl TimerName {
+    pub const VALUES: [Self; TimerName::Top as usize] = [
+        Self::TimeCurrent,
+        Self::TimeSessionEstablished,
+        Self::TimeLastHandshakeStarted,
+        Self::TimeLastPacketReceived,
+        Self::TimeLastPacketSent,
+        Self::TimeLastDataPacketReceived,
+        Self::TimeLastDataPacketSent,
+        Self::TimeCookieReceived,
+        Self::TimePersistentKeepalive,
+    ];
+}
+
 use self::TimerName::*;
 
 #[derive(Debug)]
@@ -63,6 +78,7 @@ pub struct Timers {
     persistent_keepalive: usize,
     /// Should this timer call reset rr function (if not a shared rr instance)
     pub(super) should_reset_rr: bool,
+    timers_to_update_mask: AtomicU16,
 }
 
 impl Timers {
@@ -76,6 +92,7 @@ impl Timers {
             want_handshake: Default::default(),
             persistent_keepalive: usize::from(persistent_keepalive.unwrap_or(0)),
             should_reset_rr: reset_rr,
+            timers_to_update_mask: Default::default(),
         }
     }
 
@@ -109,6 +126,12 @@ impl IndexMut<TimerName> for Timers {
 }
 
 impl Tunn {
+    pub fn mark_timer_to_update(&self, timer_name: TimerName) {
+        self.timers
+            .timers_to_update_mask
+            .fetch_or(1 << timer_name as u16, std::sync::atomic::Ordering::Relaxed);
+    }
+
     pub(super) fn timer_tick(&mut self, timer_name: TimerName) {
         match timer_name {
             TimeLastPacketReceived => {
@@ -144,7 +167,7 @@ impl Tunn {
             *session = None;
         }
 
-        self.packet_queue.clear();
+        self.packet_queue.lock().clear();
 
         self.timers.clear();
     }
@@ -179,6 +202,17 @@ impl Tunn {
         // to a second, as there is no real benefit to having highly accurate timers.
         let now = time.duration_since(self.timers.time_started);
         self.timers[TimeCurrent] = now;
+
+        // Check which timers to update, and update them
+        let timer_mask = self
+            .timers
+            .timers_to_update_mask
+            .load(std::sync::atomic::Ordering::Relaxed);
+        for timer_name in TimerName::VALUES {
+            if (timer_mask & (1 << (timer_name as u16))) != 0 {
+                self.timer_tick(timer_name);
+            }
+        }
 
         self.update_session_timers(now);
 

@@ -45,7 +45,7 @@ use crate::noise::ring_buffers::{
 };
 use crate::noise::session::Session;
 use crate::noise::timers::TimerName;
-use crate::noise::{NeptunResult, Packet, Tunn, TunnResult};
+use crate::noise::{NeptunResult, Packet, Tunn, TunnResult, IFACE_ITER};
 use crate::x25519;
 use allowed_ips::AllowedIps;
 use crossbeam::channel::{Receiver, Sender};
@@ -178,7 +178,6 @@ pub struct Device {
     uapi_fd: i32,
 }
 
-static mut IFACE_ITER: usize = 0;
 static mut TUN_ITER: usize = 0;
 
 struct ThreadData {
@@ -354,6 +353,8 @@ impl Device {
             keepalive,
             next_index,
             None,
+            self.encyrpt_tx.clone(),
+            self.network_tx.clone(),
         );
 
         let peer = Peer::new(tunn, next_index, endpoint, allowed_ips, preshared_key);
@@ -890,92 +891,35 @@ impl Device {
                 for _ in 0..MAX_ITR {
                     let element = unsafe { &mut PLAINTEXT_RING_BUFFER[IFACE_ITER] };
                     if element.is_element_free.load(Ordering::Relaxed) {
-                        {
-                            let src = match iface.read(&mut element.data[..mtu]) {
-                                Ok(src) => src,
-                                Err(Error::IfaceRead(e)) => {
-                                    let ek = e.kind();
-                                    if ek == io::ErrorKind::Interrupted
-                                        || ek == io::ErrorKind::WouldBlock
-                                    {
-                                        break;
-                                    }
-                                    eprintln!("Fatal read error on tun interface: {:?}", e);
-                                    return Action::Exit;
-                                }
-                                Err(e) => {
-                                    eprintln!("Unexpected error on tun interface: {:?}", e);
-                                    return Action::Exit;
-                                }
-                            };
-
-                            let dst_addr = match Tunn::dst_address(src) {
-                                Some(addr) => addr,
-                                None => continue,
-                            };
-
-                            let peer = match peers.find(dst_addr) {
-                                Some(peer) => peer,
-                                None => continue,
-                            };
-                            {
-                                let tun = &peer.tunnel;
-                                let current = tun.current.load(Ordering::Relaxed);
-                                if let Some(ref session) = tun.sessions.read()[current % N_SESSIONS]
+                        let len = match iface.read(&mut element.data[..mtu]) {
+                            Ok(src) => src.len(),
+                            Err(Error::IfaceRead(e)) => {
+                                let ek = e.kind();
+                                if ek == io::ErrorKind::Interrupted
+                                    || ek == io::ErrorKind::WouldBlock
                                 {
-                                    // Send the packet using an established session
-                                    element.buf_len = src.len();
-                                    element.sending_index = session.sending_index;
-                                    element.sender = Some(session.sender.clone());
-                                    element.sending_key_counter =
-                                        session.sending_key_counter.clone();
-                                    element.peer = Some(peer.clone());
-                                    tun.mark_timer_to_update(TimerName::TimeLastPacketSent);
-                                    // Exclude Keepalive packets from timer update.
-                                    if !src.is_empty() {
-                                        tun.mark_timer_to_update(TimerName::TimeLastDataPacketSent);
-                                    }
-
-                                    element.is_element_free.store(false, Ordering::Relaxed);
-                                    let _ = d.encyrpt_tx.send(element);
-                                    if unsafe { IFACE_ITER != (RB_SIZE - 1) } {
-                                        unsafe { IFACE_ITER += 1 };
-                                    } else {
-                                        // Reset the write iterator
-                                        unsafe { IFACE_ITER = 0 };
-                                    }
-                                    // Update the timers!
-                                } else {
-                                    // Q the packet
-                                    tun.queue_packet(src);
-                                    // Initiate handshake
-                                    // TODO: Have to fix this. This can't be a hardcoded 0th iter
-                                    if let Some(dst) = unsafe { ENCRYPTED_RING_BUFFER.get_mut(0) } {
-                                        {
-                                            dst.peer = Some(peer.clone());
-                                            let res = tun.format_handshake_initiation(
-                                                dst.data.as_mut_slice(),
-                                                true,
-                                            );
-                                            match res {
-                                                NeptunResult::Done => dst.res = NeptunResult::Done,
-                                                NeptunResult::Err(e) => {
-                                                    dst.res = NeptunResult::Err(e)
-                                                }
-                                                NeptunResult::WriteToNetwork(n) => {
-                                                    dst.res = NeptunResult::WriteToNetwork(n)
-                                                }
-                                                _ => continue,
-                                            }
-                                        };
-                                        // This has to change. Atm, can handle only 1 and only
-                                        // at the beginning
-                                        dst.is_element_free.store(false, Ordering::Relaxed);
-                                        let _ = d.network_tx.send(dst);
-                                    }
+                                    break;
                                 }
-                            };
-                        }
+                                eprintln!("Fatal read error on tun interface: {:?}", e);
+                                return Action::Exit;
+                            }
+                            Err(e) => {
+                                eprintln!("Unexpected error on tun interface: {:?}", e);
+                                return Action::Exit;
+                            }
+                        };
+
+                        let dst_addr = match Tunn::dst_address(&element.data[..len]) {
+                            Some(addr) => addr,
+                            None => continue,
+                        };
+
+                        let peer = match peers.find(dst_addr) {
+                            Some(peer) => peer,
+                            None => continue,
+                        };
+                        let tun = &peer.tunnel;
+                        tun.encapsulate(len, element, peer.clone());
                     }
                 }
                 Action::Continue

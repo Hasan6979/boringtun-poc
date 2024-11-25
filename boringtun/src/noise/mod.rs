@@ -9,9 +9,12 @@ pub mod ring_buffers;
 pub mod session;
 pub mod timers;
 
+use crossbeam::channel::Sender;
 use parking_lot::{Mutex, RwLock};
+use ring_buffers::{EncryptionTaskData, NetworkTaskData, ENCRYPTED_RING_BUFFER, RB_SIZE};
 use session::Session;
 
+use crate::device::peer::Peer;
 use crate::noise::errors::WireGuardError;
 use crate::noise::handshake::Handshake;
 use crate::noise::rate_limiter::RateLimiter;
@@ -46,6 +49,8 @@ const IP_LEN_SZ: usize = 2;
 const MAX_QUEUE_DEPTH: usize = 256;
 /// number of sessions in the ring, better keep a PoT
 const N_SESSIONS: usize = 8;
+
+pub static mut IFACE_ITER: usize = 0;
 
 #[derive(Debug)]
 pub enum TunnResult<'a> {
@@ -93,6 +98,8 @@ pub struct Tunn {
     rx_bytes: AtomicUsize,
     rate_limiter: RwLock<Arc<RateLimiter>>,
     timers_to_update_mask: AtomicU16,
+    encyrpt_tx: Sender<&'static EncryptionTaskData>,
+    network_tx: Sender<&'static NetworkTaskData>,
 }
 
 type MessageType = u32;
@@ -212,6 +219,7 @@ impl Tunn {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     /// Create a new tunnel using own private key and the peer public key
     pub fn new(
         static_private: x25519::StaticSecret,
@@ -220,6 +228,8 @@ impl Tunn {
         persistent_keepalive: Option<u16>,
         index: u32,
         rate_limiter: Option<Arc<RateLimiter>>,
+        encyrpt_tx: Sender<&'static EncryptionTaskData>,
+        network_tx: Sender<&'static NetworkTaskData>,
     ) -> Self {
         let static_public = x25519::PublicKey::from(&static_private);
 
@@ -243,6 +253,8 @@ impl Tunn {
                 Arc::new(RateLimiter::new(&static_public, PEER_HANDSHAKE_RATE_LIMIT))
             })),
             timers_to_update_mask: Default::default(),
+            encyrpt_tx,
+            network_tx,
         }
     }
 
@@ -273,39 +285,69 @@ impl Tunn {
         }
     }
 
-    //     /// Encapsulate a single packet from the tunnel interface.
-    //     /// Returns TunnResult.
-    //     ///
-    //     /// # Panics
-    //     /// Panics if dst buffer is too small.
-    //     /// Size of dst should be at least src.len() + 32, and no less than 148 bytes.
-    //     pub fn encapsulate<'a>(&mut self, src: &[u8], dst: &mut [u8]) {
-    //         let current = self.current;
-    //         if let Some(ref session) = self.sessions[current % N_SESSIONS] {
-    //             // Send the packet using an established session
-    //             // SRC_RING_BUFFER;
-    //             // let packet = Session::encrypt_data_pkt(
-    //             //     &session.sending_key_counter,
-    //             //     session.sending_index,
-    //             //     session.sender.clone(),
-    //             //     src,
-    //             //     dst,
-    //             // );
-    //             // self.timer_tick(TimerName::TimeLastPacketSent);
-    //             // Exclude Keepalive packets from timer update.
-    //             // if !src.is_empty() {
-    //             //     self.timer_tick(TimerName::TimeLastDataPacketSent);
-    //             // }
-    //             // self.tx_bytes += src.len();
-    //             // unsafe { SRC_RING_BUFFER.push_back(src) };
-    //             // return TunnResult::WriteToNetwork(packet);
-    //         }
+    /// Encapsulate a single packet from the tunnel interface.
+    /// Returns TunnResult.
+    ///
+    /// # Panics
+    /// Panics if dst buffer is too small.
+    /// Size of dst should be at least src.len() + 32, and no less than 148 bytes.
+    pub fn encapsulate(
+        &self,
+        len: usize,
+        element: &'static mut EncryptionTaskData,
+        peer: Arc<Peer>,
+    ) {
+        let current = self.current.load(Ordering::Relaxed);
+        if let Some(ref session) = self.sessions.read()[current % N_SESSIONS] {
+            // Send the packet using an established session
+            element.buf_len = len;
+            element.sending_index = session.sending_index;
+            element.sender = Some(session.sender.clone());
+            element.sending_key_counter = session.sending_key_counter.clone();
+            element.peer = Some(peer.clone());
 
-    //         // If there is no session, queue the packet for future retry
-    //         self.queue_packet(src);
-    //         // Initiate a new handshake if none is in progress
-    //         self.format_handshake_initiation(dst, false);
-    //     }
+            self.mark_timer_to_update(TimerName::TimeLastPacketSent);
+            // Exclude Keepalive packets from timer update.
+            if len == 0 {
+                self.mark_timer_to_update(TimerName::TimeLastDataPacketSent);
+            }
+            self.tx_bytes.fetch_add(len, Ordering::Relaxed);
+            element.is_element_free.store(false, Ordering::Relaxed);
+            let _ = self.encyrpt_tx.send(element);
+            if unsafe { IFACE_ITER != (RB_SIZE - 1) } {
+                unsafe { IFACE_ITER += 1 };
+            } else {
+                // Reset the write iterator
+                unsafe { IFACE_ITER = 0 };
+            }
+        } else {
+            // Q the packet
+            self.queue_packet(&element.data[..len]);
+            // Initiate handshake
+            // TODO: Have to fix this. This can't be a hardcoded 0th iter
+            if let Some(dst) = unsafe { ENCRYPTED_RING_BUFFER.get_mut(0) } {
+                {
+                    dst.peer = Some(peer.clone());
+                    let res = self.format_handshake_initiation(dst.data.as_mut_slice(), true);
+                    match res {
+                        NeptunResult::Done => return,
+                        NeptunResult::Err(e) => {
+                            tracing::error!(message = "Handshake initiation error", error = ?e);
+                            return;
+                        }
+                        NeptunResult::WriteToNetwork(n) => {
+                            dst.res = NeptunResult::WriteToNetwork(n)
+                        }
+                        _ => panic!("Unexpected result from handshake initiation"),
+                    }
+                };
+                // This has to change. Atm, can handle only 1 and only
+                // at the beginning
+                dst.is_element_free.store(false, Ordering::Relaxed);
+                let _ = self.network_tx.send(dst);
+            }
+        }
+    }
 
     /// Receives a UDP datagram from the network and parses it.
     /// Returns TunnResult.

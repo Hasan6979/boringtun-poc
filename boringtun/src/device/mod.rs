@@ -508,7 +508,7 @@ impl Device {
         let rate_limiter = Arc::new(RateLimiter::new(&public_key, HANDSHAKE_RATE_LIMIT));
 
         for peer in self.peers.values_mut() {
-            peer.tunnel.lock().set_static_private(
+            peer.tunnel.set_static_private(
                 private_key.clone(),
                 public_key,
                 Some(Arc::clone(&rate_limiter)),
@@ -593,7 +593,7 @@ impl Device {
                     };
 
                     let res = {
-                        let mut tun = peer.tunnel.lock();
+                        let tun = &peer.tunnel;
                         tun.update_timers(&mut t.dst_buf[..])
                     };
                     match res {
@@ -697,14 +697,14 @@ impl Device {
                     // We found a peer, use it to decapsulate the message+
                     let mut flush = false; // Are there packets to send from the queue?
                     let res = {
-                        let mut tun = peer.tunnel.lock();
+                        let tun = &peer.tunnel;
                         if let Some(pkt) = data_pkt {
                             let r_idx = pkt.receiver_idx as usize;
                             let idx = r_idx % N_SESSIONS;
                             // Get the (probably) right session
                             {
-                                let session = tun.sessions[idx].as_ref();
-                                match session {
+                                let session = tun.sessions.read();
+                                match session[idx].as_ref() {
                                     Some(session) => {
                                         element.counter = pkt.counter;
                                         element.buf_len = packet_len;
@@ -754,7 +754,7 @@ impl Device {
                         // Flush pending queue
                         loop {
                             let res = {
-                                let mut tun = peer.tunnel.lock();
+                                let tun = &peer.tunnel;
                                 tun.decapsulate(None, &[], &mut t.dst_buf[..])
                             };
 
@@ -817,7 +817,7 @@ impl Device {
                 while let Ok(read_bytes) = udp.recv(src_buf) {
                     let mut flush = false;
                     let res = {
-                        let mut tun = peer.tunnel.lock();
+                        let tun = &peer.tunnel;
                         tun.decapsulate(
                             Some(peer_addr),
                             &t.src_buf[..read_bytes],
@@ -848,7 +848,7 @@ impl Device {
                         // Flush pending queue
                         loop {
                             let res = {
-                                let mut tun = peer.tunnel.lock();
+                                let tun = &peer.tunnel;
                                 tun.decapsulate(None, &[], &mut t.dst_buf[..])
                             };
 
@@ -919,9 +919,10 @@ impl Device {
                                 None => continue,
                             };
                             {
-                                let mut tun = peer.tunnel.lock();
-                                let current = tun.current;
-                                if let Some(ref session) = tun.sessions[current % N_SESSIONS] {
+                                let tun = &peer.tunnel;
+                                let current = tun.current.load(Ordering::Relaxed);
+                                if let Some(ref session) = tun.sessions.read()[current % N_SESSIONS]
+                                {
                                     // Send the packet using an established session
                                     element.buf_len = src.len();
                                     element.sending_index = session.sending_index;

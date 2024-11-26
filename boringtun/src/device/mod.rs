@@ -592,7 +592,7 @@ impl Device {
 
                     let res = {
                         let tun = &peer.tunnel;
-                        tun.update_timers(&mut t.dst_buf[..])
+                        tun.update_timers(peer.clone())
                     };
                     match res {
                         TunnResult::Done => {}
@@ -866,7 +866,7 @@ impl Device {
     fn register_iface_handler(&self, iface: Arc<TunSocket>) -> Result<(), Error> {
         self.queue.new_event(
             iface.as_raw_fd(),
-            Box::new(move |d, t| {
+            Box::new(move |d, _t| {
                 // The iface_handler handles packets received from the WireGuard virtual network
                 // interface. The flow is as follows:
                 // * Read a packet
@@ -874,9 +874,6 @@ impl Device {
                 // * Encapsulate the packet for the given peer
                 // * Send encapsulated packet to the peer's endpoint
                 let mtu = d.mtu.load(Ordering::Relaxed);
-
-                let udp4 = d.udp4.as_ref().expect("Not connected");
-                let udp6 = d.udp6.as_ref().expect("Not connected");
 
                 let peers = &d.peers_by_ip;
                 for _ in 0..MAX_ITR {

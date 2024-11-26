@@ -2,11 +2,14 @@
 // SPDX-License-Identifier: BSD-3-Clause
 
 use super::errors::WireGuardError;
+use super::ring_buffers::PLAINTEXT_RING_BUFFER;
+use crate::device::peer::Peer;
 use crate::noise::{Tunn, TunnResult};
 use std::mem;
 use std::ops::{Index, IndexMut};
 
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 #[cfg(feature = "mock-instant")]
@@ -196,7 +199,7 @@ impl Tunn {
         }
     }
 
-    pub fn update_timers<'a>(&self, dst: &'a mut [u8]) -> TunnResult<'a> {
+    pub fn update_timers<'a>(&self, peer: Arc<Peer>) -> TunnResult<'a> {
         let mut handshake_initiation_required = false;
         let mut keepalive_required = false;
 
@@ -348,13 +351,17 @@ impl Tunn {
             }
         }
 
-        // if handshake_initiation_required {
-        //     return self.format_handshake_initiation(dst, true);
-        // }
+        if handshake_initiation_required {
+            self.initiate_handshake(peer, true);
+            return TunnResult::Done;
+        }
 
-        // if keepalive_required {
-        //     return self.encapsulate(&[], dst);
-        // }
+        if keepalive_required {
+            let element = unsafe { PLAINTEXT_RING_BUFFER.get_next() };
+            if element.is_element_free.load(Ordering::Relaxed) {
+                self.encapsulate(0, element, peer);
+            }
+        }
 
         TunnResult::Done
     }

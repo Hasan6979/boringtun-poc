@@ -43,7 +43,7 @@ use crate::noise::ring_buffers::{
     DecryptionTaskData, EncryptionTaskData, NetworkTaskData, PLAINTEXT_RING_BUFFER, RB_SIZE,
     RX_RING_BUFFER,
 };
-use crate::noise::session::Session;
+use crate::noise::session::{Session, DATA_OFFSET};
 use crate::noise::timers::TimerName;
 use crate::noise::{NeptunResult, Packet, Tunn, TunnResult};
 use crate::x25519;
@@ -165,11 +165,11 @@ pub struct Device {
 
     rate_limiter: Option<Arc<RateLimiter>>,
 
-    encyrpt_tx: Sender<&'static EncryptionTaskData>,
+    encyrpt_tx: Sender<usize>,
     decyrpt_tx: Sender<&'static DecryptionTaskData>,
 
-    network_rx: Receiver<&'static NetworkTaskData>,
-    network_tx: Sender<&'static NetworkTaskData>,
+    network_rx: Receiver<&'static EncryptionTaskData>,
+    network_tx: Sender<&'static EncryptionTaskData>,
 
     tunnel_rx: Receiver<&'static NetworkTaskData>,
     tunnel_tx: Sender<&'static NetworkTaskData>,
@@ -652,7 +652,7 @@ impl Device {
                 // let src_buf =
                     // unsafe { &mut *(&mut t.src_buf[..] as *mut [u8] as *mut [MaybeUninit<u8>]) };
                 loop {
-                    let element = unsafe { RX_RING_BUFFER.get_next() };
+                    let (element, _) = unsafe { RX_RING_BUFFER.get_next() };
                     if element.is_element_free.load(Ordering::Relaxed) {
                             let src_buf =
                             unsafe { &mut *(&mut element.data[..] as *mut [u8] as *mut [MaybeUninit<u8>]) };
@@ -877,9 +877,9 @@ impl Device {
 
                 let peers = &d.peers_by_ip;
                 for _ in 0..MAX_ITR {
-                    let element = unsafe { PLAINTEXT_RING_BUFFER.get_next() };
+                    let (element, iter) = unsafe { PLAINTEXT_RING_BUFFER.get_next() };
                     if element.is_element_free.load(Ordering::Relaxed) {
-                        let len = match iface.read(&mut element.data[..mtu]) {
+                        let len = match iface.read(&mut element.data[DATA_OFFSET..mtu]) {
                             Ok(src) => src.len(),
                             Err(Error::IfaceRead(e)) => {
                                 let ek = e.kind();
@@ -896,8 +896,7 @@ impl Device {
                                 return Action::Exit;
                             }
                         };
-
-                        let dst_addr = match Tunn::dst_address(&element.data[..len]) {
+                        let dst_addr = match Tunn::dst_address(&element.data[DATA_OFFSET..len]) {
                             Some(addr) => addr,
                             None => continue,
                         };
@@ -907,7 +906,7 @@ impl Device {
                             None => continue,
                         };
                         let tun = &peer.tunnel;
-                        tun.encapsulate(len, element, peer.clone());
+                        tun.encapsulate(len, element, iter, peer.clone());
                     }
                 }
                 Action::Continue
@@ -948,7 +947,11 @@ fn send_to_tunnel(tunnel_rx: Receiver<&NetworkTaskData>, iface: Arc<TunSocket>) 
     }
 }
 
-fn send_to_network(network_rx: Receiver<&NetworkTaskData>, udp4: Arc<Socket>, udp6: Arc<Socket>) {
+fn send_to_network(
+    network_rx: Receiver<&EncryptionTaskData>,
+    udp4: Arc<Socket>,
+    udp6: Arc<Socket>,
+) {
     while let Ok(msg) = network_rx.recv() {
         match &msg.res {
             NeptunResult::Done => {}

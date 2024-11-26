@@ -73,6 +73,7 @@ pub struct EncryptionTaskData {
     pub sending_index: u32,
     pub peer: Option<Arc<Peer>>,
     pub is_element_free: AtomicBool,
+    pub res: NeptunResult,
 }
 
 pub static mut PLAINTEXT_RING_BUFFER: Lazy<RingBuffer<EncryptionTaskData>> = Lazy::new(|| {
@@ -86,11 +87,12 @@ pub static mut PLAINTEXT_RING_BUFFER: Lazy<RingBuffer<EncryptionTaskData>> = Laz
             sending_index: 0,
             peer: None,
             is_element_free: AtomicBool::new(true),
+            res: NeptunResult::Done,
         });
     }
     RingBuffer {
         ring_buffer: deque,
-        iter: AtomicUsize::new(0),
+        iter: Mutex::new(0),
     }
 });
 

@@ -40,7 +40,7 @@ impl std::fmt::Debug for Session {
 }
 
 /// Where encrypted data resides in a data packet
-const DATA_OFFSET: usize = 16;
+pub const DATA_OFFSET: usize = 16;
 /// The overhead of the AEAD
 const AEAD_SIZE: usize = 16;
 
@@ -212,53 +212,44 @@ impl Session {
     }
 
     pub fn encrypt_data_worker(
-        encrypt_rx: Receiver<&EncryptionTaskData>,
-        network_tx: Sender<&NetworkTaskData>,
+        encrypt_rx: Receiver<usize>,
+        network_tx: Sender<&EncryptionTaskData>,
     ) {
-        while let Ok(encryption_data) = encrypt_rx.recv() {
-            let network_data = unsafe { ENCRYPTED_RING_BUFFER.get_next() };
-            loop {
-                if network_data.is_element_free.load(Ordering::Relaxed) {
-                    let data_len = encryption_data.buf_len;
-                    let (_, data_len) = Session::encrypt_data_pkt(
-                        encryption_data.sending_key_counter.clone(),
-                        encryption_data.sending_index,
-                        encryption_data.sender.as_ref().unwrap().clone(),
-                        &encryption_data.data.as_slice()[..data_len],
-                        network_data.data.as_mut_slice(),
-                    );
-                    network_data.peer = Some(encryption_data.peer.as_ref().unwrap().clone());
-                    network_data.buf_len = data_len;
-                    network_data.res = NeptunResult::WriteToNetwork(data_len);
+        while let Ok(iter) = encrypt_rx.recv() {
+            let encryption_data = unsafe { &mut PLAINTEXT_RING_BUFFER.ring_buffer[iter] };
+            let data_len = encryption_data.buf_len;
+            let (_, data_len) = Session::encrypt_data_pkt(
+                encryption_data.sending_key_counter.clone(),
+                encryption_data.sending_index,
+                encryption_data.sender.as_ref().unwrap().clone(),
+                data_len,
+                encryption_data.data.as_mut_slice(),
+            );
 
-                    network_data.is_element_free.store(false, Ordering::Relaxed);
-                    let _ = network_tx.send(network_data);
-                    break;
-                }
-            }
-            encryption_data
-                .is_element_free
-                .store(true, Ordering::Relaxed);
+            encryption_data.buf_len = data_len;
+            encryption_data.res = NeptunResult::WriteToNetwork(data_len);
+
+            let _ = network_tx.send(encryption_data);
         }
     }
 
     /// src - an IP packet from the interface
     /// dst - pre-allocated space to hold the encapsulating UDP packet to send over the network
     /// returns the size of the formatted packet
-    pub fn encrypt_data_pkt<'a>(
+    pub fn encrypt_data_pkt(
         sending_key_counter: Arc<AtomicUsize>,
         sending_index: u32,
         sender: Arc<LessSafeKey>,
-        src: &[u8],
-        dst: &'a mut [u8],
-    ) -> (&'a mut [u8], usize) {
-        if dst.len() < src.len() + super::DATA_OVERHEAD_SZ {
+        data_len: usize,
+        ring_buffer: &mut [u8],
+    ) -> (&mut [u8], usize) {
+        if ring_buffer.len() < data_len + super::DATA_OVERHEAD_SZ {
             panic!("The destination buffer is too small");
         }
 
         let sending_key_counter = sending_key_counter.fetch_add(1, Ordering::Relaxed) as u64;
 
-        let (message_type, rest) = dst.split_at_mut(4);
+        let (message_type, rest) = ring_buffer.split_at_mut(4);
         let (receiver_index, rest) = rest.split_at_mut(4);
         let (counter, data) = rest.split_at_mut(8);
 
@@ -270,21 +261,21 @@ impl Session {
         let n = {
             let mut nonce = [0u8; 12];
             nonce[4..12].copy_from_slice(&sending_key_counter.to_le_bytes());
-            data[..src.len()].copy_from_slice(src);
             sender
                 .seal_in_place_separate_tag(
                     Nonce::assume_unique_for_key(nonce),
                     Aad::from(&[]),
-                    &mut data[..src.len()],
+                    &mut data[..data_len],
                 )
                 .map(|tag| {
-                    data[src.len()..src.len() + AEAD_SIZE].copy_from_slice(tag.as_ref());
-                    src.len() + AEAD_SIZE
+                    data[data_len..data_len + AEAD_SIZE]
+                        .copy_from_slice(tag.as_ref());
+                    data_len + AEAD_SIZE
                 })
                 .unwrap()
         };
 
-        (&mut dst[..DATA_OFFSET + n], DATA_OFFSET + n)
+        (&mut ring_buffer[..DATA_OFFSET + n], DATA_OFFSET + n)
     }
 
     pub fn decrypt_data_worker(
@@ -292,7 +283,7 @@ impl Session {
         tunnel_tx: Sender<&NetworkTaskData>,
     ) {
         while let Ok(decryption_data) = decrypt_rx.recv() {
-            let network_data = unsafe { DECRYPTED_RING_BUFFER.get_next() };
+            let (network_data, _) = unsafe { DECRYPTED_RING_BUFFER.get_next() };
             loop {
                 if network_data.is_element_free.load(Ordering::Relaxed) {
                     let data_len = decryption_data.buf_len;
@@ -396,7 +387,7 @@ mod tests {
         std::thread::spawn(move || Session::encrypt_data_worker(rx_clone, tx1));
 
         // Generate some data
-        let item = unsafe { PLAINTEXT_RING_BUFFER.get_next() };
+        let (item, iter) = unsafe { PLAINTEXT_RING_BUFFER.get_next() };
         {
             let x = item.data.as_mut_slice();
             for i in 0..10 {
@@ -408,9 +399,9 @@ mod tests {
             println!("data {:?}", &item.data[..item.buf_len]);
             item.sending_key_counter = session.sending_key_counter.clone();
         }
-        let _ = tx.send(item);
+        let _ = tx.send(iter);
         if rx1.recv().is_ok() {
-            let en_msg = unsafe { ENCRYPTED_RING_BUFFER.get_next() };
+            let (en_msg, _) = unsafe { ENCRYPTED_RING_BUFFER.get_next() };
             let src = &en_msg.data[..en_msg.buf_len];
             println!("encrypted data {:?}", src);
         }

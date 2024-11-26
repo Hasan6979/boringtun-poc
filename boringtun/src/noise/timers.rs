@@ -357,9 +357,9 @@ impl Tunn {
         }
 
         if keepalive_required {
-            let element = unsafe { PLAINTEXT_RING_BUFFER.get_next() };
+            let (element, iter) = unsafe { PLAINTEXT_RING_BUFFER.get_next() };
             if element.is_element_free.load(Ordering::Relaxed) {
-                self.encapsulate(0, element, peer);
+                self.encapsulate(0, element, iter, peer);
             }
         }
 

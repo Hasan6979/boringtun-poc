@@ -11,7 +11,9 @@ pub mod timers;
 
 use crossbeam::channel::Sender;
 use parking_lot::{Mutex, RwLock};
-use ring_buffers::{EncryptionTaskData, NetworkTaskData, ENCRYPTED_RING_BUFFER};
+use ring_buffers::{
+    EncryptionTaskData, NetworkTaskData, ENCRYPTED_RING_BUFFER, PLAINTEXT_RING_BUFFER,
+};
 use session::Session;
 
 use crate::device::peer::Peer;
@@ -96,8 +98,8 @@ pub struct Tunn {
     pub rx_bytes: AtomicUsize,
     rate_limiter: RwLock<Arc<RateLimiter>>,
     timers_to_update_mask: AtomicU16,
-    encyrpt_tx: Sender<&'static EncryptionTaskData>,
-    network_tx: Sender<&'static NetworkTaskData>,
+    encyrpt_tx: Sender<usize>,
+    network_tx: Sender<&'static EncryptionTaskData>,
 }
 
 type MessageType = u32;
@@ -226,8 +228,8 @@ impl Tunn {
         persistent_keepalive: Option<u16>,
         index: u32,
         rate_limiter: Option<Arc<RateLimiter>>,
-        encyrpt_tx: Sender<&'static EncryptionTaskData>,
-        network_tx: Sender<&'static NetworkTaskData>,
+        encyrpt_tx: Sender<usize>,
+        network_tx: Sender<&'static EncryptionTaskData>,
     ) -> Self {
         let static_public = x25519::PublicKey::from(&static_private);
 
@@ -293,10 +295,12 @@ impl Tunn {
         &self,
         len: usize,
         element: &'static mut EncryptionTaskData,
+        iter: usize,
         peer: Arc<Peer>,
     ) {
         let current = self.current.load(Ordering::Relaxed);
         if let Some(ref session) = self.sessions.read()[current % N_SESSIONS] {
+            element.is_element_free.store(false, Ordering::Relaxed);
             // Send the packet using an established session
             element.buf_len = len;
             element.sending_index = session.sending_index;
@@ -310,8 +314,7 @@ impl Tunn {
                 self.mark_timer_to_update(TimerName::TimeLastDataPacketSent);
             }
             self.tx_bytes.fetch_add(len, Ordering::Relaxed);
-            element.is_element_free.store(false, Ordering::Relaxed);
-            let _ = self.encyrpt_tx.send(element);
+            let _ = self.encyrpt_tx.send(iter);
             return;
         }
 
@@ -323,7 +326,7 @@ impl Tunn {
 
     pub fn initiate_handshake(&self, peer: Arc<Peer>, force_resend: bool) {
         // TODO: Have to fix this. This can't be a hardcoded 0th iter
-        let dst = unsafe { ENCRYPTED_RING_BUFFER.get_next() };
+        let (dst, _) = unsafe { PLAINTEXT_RING_BUFFER.get_next() };
         {
             dst.peer = Some(peer.clone());
             let res = self.format_handshake_initiation(dst.data.as_mut_slice(), force_resend);
@@ -438,7 +441,7 @@ impl Tunn {
                 session.sending_key_counter.clone(),
                 session.sending_index,
                 session.sender.clone(),
-                &[],
+                0,
                 dst,
             )
         };

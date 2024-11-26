@@ -315,10 +315,9 @@ impl Session {
                         ),
                         Err(e) => NeptunResult::Err(e),
                     };
-                    // TODO: Update the following here. in peer->tunnel
-                    // But can do that after removing the outer mutability on tunnel
-                    // self.timer_tick(TimerName::TimeLastDataPacketReceived);
-                    // self.rx_bytes += computed_len;
+                    // TODO: The rx bytes and timer update is done right now
+                    // in the send_to_tunnel thread. Maybe not the best place to do it.
+                    // Overall this needs to be revisited
                     network_data.peer = Some(decryption_data.peer.as_ref().unwrap().clone());
                     decryption_data
                         .is_element_free

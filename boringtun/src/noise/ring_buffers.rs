@@ -12,22 +12,23 @@ const MAX_UDP_SIZE: usize = (1 << 14) - 1;
 pub const RB_SIZE: usize = 10;
 
 pub struct RingBuffer<T> {
-    ring_buffer: Vec<T>,
-    iter: AtomicUsize,
+    pub ring_buffer: Vec<T>,
+    iter: Mutex<usize>,
 }
 
 impl<T> RingBuffer<T> {
     // Returns the next element in ring buffer
     // and moves the ring buffer iterator forward
-    pub fn get_next(&mut self) -> &mut T {
-        let element = &mut self.ring_buffer[self.iter.load(std::sync::atomic::Ordering::Relaxed)];
-        if self.iter.load(std::sync::atomic::Ordering::Relaxed) != (RB_SIZE - 1) {
-            self.iter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        } else {
+    pub fn get_next(&mut self) -> (&mut T, usize) {
+        let mut idx = self.iter.lock();
+        if *idx == RB_SIZE {
             // Reset the write iterator
-            self.iter.store(1, std::sync::atomic::Ordering::Relaxed);
+            *idx = 0;
         }
-        element
+        let element = &mut self.ring_buffer[*idx];
+        let ret_iter = *idx;
+        *idx += 1;
+        (element, ret_iter)
     }
 }
 
@@ -60,7 +61,7 @@ pub static mut RX_RING_BUFFER: Lazy<RingBuffer<DecryptionTaskData>> = Lazy::new(
     }
     RingBuffer {
         ring_buffer: deque,
-        iter: AtomicUsize::new(0),
+        iter: Mutex::new(0),
     }
 });
 
@@ -131,6 +132,6 @@ pub static mut DECRYPTED_RING_BUFFER: Lazy<RingBuffer<NetworkTaskData>> = Lazy::
     }
     RingBuffer {
         ring_buffer: deque,
-        iter: AtomicUsize::new(0),
+        iter: Mutex::new(0),
     }
 });

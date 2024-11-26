@@ -925,12 +925,20 @@ fn send_to_tunnel(tunnel_rx: Receiver<&NetworkTaskData>, iface: Arc<TunSocket>) 
                 tracing::error!(message = "Decapsulate error", error = ?e)
             }
             NeptunResult::WriteToTunnelV4(buf_len, addr) => {
-                if msg.peer.as_ref().unwrap().is_allowed_ip(*addr) {
+                let peer = msg.peer.as_ref().unwrap();
+                peer.tunnel.rx_bytes.fetch_add(*buf_len, Ordering::Relaxed);
+                peer.tunnel
+                    .mark_timer_to_update(TimerName::TimeLastDataPacketReceived);
+                if peer.is_allowed_ip(*addr) {
                     iface.write4(&msg.data.as_slice()[..*buf_len]);
                 }
             }
             NeptunResult::WriteToTunnelV6(buf_len, addr) => {
-                if msg.peer.as_ref().unwrap().is_allowed_ip(*addr) {
+                let peer = msg.peer.as_ref().unwrap();
+                peer.tunnel.rx_bytes.fetch_add(*buf_len, Ordering::Relaxed);
+                peer.tunnel
+                    .mark_timer_to_update(TimerName::TimeLastDataPacketReceived);
+                if peer.is_allowed_ip(*addr) {
                     iface.write6(&msg.data.as_slice()[..*buf_len]);
                 }
             }

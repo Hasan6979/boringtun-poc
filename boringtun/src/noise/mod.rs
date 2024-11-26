@@ -93,7 +93,7 @@ pub struct Tunn {
     /// Keeps tabs on the expiring timers
     timers: timers::Timers,
     pub tx_bytes: AtomicUsize,
-    rx_bytes: AtomicUsize,
+    pub rx_bytes: AtomicUsize,
     rate_limiter: RwLock<Arc<RateLimiter>>,
     timers_to_update_mask: AtomicU16,
     encyrpt_tx: Sender<&'static EncryptionTaskData>,
@@ -590,9 +590,7 @@ impl Tunn {
             return NeptunResult::Err(WireGuardError::InvalidPacket);
         }
 
-        // Fix this later!!
-        // self.timer_tick(TimerName::TimeLastDataPacketReceived);
-        // self.rx_bytes += computed_len;
+        // Moved to send_to_tunnel worker
 
         match src_ip_address {
             IpAddr::V4(addr) => NeptunResult::WriteToTunnelV4(computed_len, addr),

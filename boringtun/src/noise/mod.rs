@@ -12,7 +12,7 @@ pub mod timers;
 use crossbeam::channel::Sender;
 use parking_lot::{Mutex, RwLock};
 use ring_buffers::{
-    EncryptionTaskData, NetworkTaskData, ENCRYPTED_RING_BUFFER, PLAINTEXT_RING_BUFFER,
+    EncryptionTaskData, PLAINTEXT_RING_BUFFER,
 };
 use session::Session;
 

@@ -41,6 +41,7 @@ pub struct DecryptionTaskData {
     pub data: [u8; MAX_UDP_SIZE],
     pub buf_len: usize,
     pub peer: Option<Arc<Peer>>,
+    pub res: NeptunResult,
     pub is_element_free: AtomicBool,
 }
 
@@ -57,6 +58,7 @@ pub static mut RX_RING_BUFFER: Lazy<RingBuffer<DecryptionTaskData>> = Lazy::new(
             receiving_index: 0,
             peer: None,
             is_element_free: AtomicBool::new(true),
+            res: NeptunResult::Done,
         });
     }
     RingBuffer {
@@ -88,48 +90,6 @@ pub static mut PLAINTEXT_RING_BUFFER: Lazy<RingBuffer<EncryptionTaskData>> = Laz
             peer: None,
             is_element_free: AtomicBool::new(true),
             res: NeptunResult::Done,
-        });
-    }
-    RingBuffer {
-        ring_buffer: deque,
-        iter: Mutex::new(0),
-    }
-});
-
-pub struct NetworkTaskData {
-    pub data: [u8; MAX_UDP_SIZE],
-    pub buf_len: usize,
-    pub peer: Option<Arc<Peer>>,
-    pub res: NeptunResult,
-    pub is_element_free: AtomicBool,
-}
-
-pub static mut ENCRYPTED_RING_BUFFER: Lazy<RingBuffer<NetworkTaskData>> = Lazy::new(|| {
-    let mut deque = Vec::with_capacity(RB_SIZE);
-    for _ in 0..RB_SIZE {
-        deque.push(NetworkTaskData {
-            data: [0; MAX_UDP_SIZE],
-            buf_len: 0,
-            peer: None,
-            res: NeptunResult::Done,
-            is_element_free: AtomicBool::new(true),
-        });
-    }
-    RingBuffer {
-        ring_buffer: deque,
-        iter: AtomicUsize::new(0),
-    }
-});
-
-pub static mut DECRYPTED_RING_BUFFER: Lazy<RingBuffer<NetworkTaskData>> = Lazy::new(|| {
-    let mut deque = Vec::with_capacity(RB_SIZE);
-    for _ in 0..RB_SIZE {
-        deque.push(NetworkTaskData {
-            data: [0; MAX_UDP_SIZE],
-            buf_len: 0,
-            peer: None,
-            res: NeptunResult::Done,
-            is_element_free: AtomicBool::new(true),
         });
     }
     RingBuffer {

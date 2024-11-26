@@ -40,8 +40,7 @@ use crate::noise::errors::WireGuardError;
 use crate::noise::handshake::parse_handshake_anon;
 use crate::noise::rate_limiter::RateLimiter;
 use crate::noise::ring_buffers::{
-    DecryptionTaskData, EncryptionTaskData, NetworkTaskData, PLAINTEXT_RING_BUFFER, RB_SIZE,
-    RX_RING_BUFFER,
+    DecryptionTaskData, EncryptionTaskData, PLAINTEXT_RING_BUFFER, RB_SIZE, RX_RING_BUFFER,
 };
 use crate::noise::session::{Session, DATA_OFFSET};
 use crate::noise::timers::TimerName;
@@ -166,13 +165,13 @@ pub struct Device {
     rate_limiter: Option<Arc<RateLimiter>>,
 
     encyrpt_tx: Sender<usize>,
-    decyrpt_tx: Sender<&'static DecryptionTaskData>,
+    decyrpt_tx: Sender<usize>,
 
     network_rx: Receiver<&'static EncryptionTaskData>,
     network_tx: Sender<&'static EncryptionTaskData>,
 
-    tunnel_rx: Receiver<&'static NetworkTaskData>,
-    tunnel_tx: Sender<&'static NetworkTaskData>,
+    tunnel_rx: Receiver<&'static DecryptionTaskData>,
+    tunnel_tx: Sender<&'static DecryptionTaskData>,
     #[cfg(target_os = "linux")]
     uapi_fd: i32,
 }
@@ -652,7 +651,7 @@ impl Device {
                 // let src_buf =
                     // unsafe { &mut *(&mut t.src_buf[..] as *mut [u8] as *mut [MaybeUninit<u8>]) };
                 loop {
-                    let (element, _) = unsafe { RX_RING_BUFFER.get_next() };
+                    let (element, rb_iter) = unsafe { RX_RING_BUFFER.get_next() };
                     if element.is_element_free.load(Ordering::Relaxed) {
                             let src_buf =
                             unsafe { &mut *(&mut element.data[..] as *mut [u8] as *mut [MaybeUninit<u8>]) };
@@ -713,7 +712,7 @@ impl Device {
                                         tun.set_current_session(r_idx);
                                         tun.mark_timer_to_update(TimerName::TimeLastPacketReceived);
                                         element.is_element_free.store(false, Ordering::Relaxed);
-                                        let _ = d.decyrpt_tx.send(element);
+                                        let _ = d.decyrpt_tx.send(rb_iter);
                                         TunnResult::Done},
                                     None => {tracing::trace!(message = "No current session available", remote_idx = r_idx);
                                         TunnResult::Err(WireGuardError::NoCurrentSession)}
@@ -916,7 +915,7 @@ impl Device {
     }
 }
 
-fn send_to_tunnel(tunnel_rx: Receiver<&NetworkTaskData>, iface: Arc<TunSocket>) {
+fn send_to_tunnel(tunnel_rx: Receiver<&DecryptionTaskData>, iface: Arc<TunSocket>) {
     while let Ok(msg) = tunnel_rx.recv() {
         match &msg.res {
             NeptunResult::Done => {}

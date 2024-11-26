@@ -2,11 +2,8 @@
 // SPDX-License-Identifier: BSD-3-Clause
 
 use super::{
-    ring_buffers::{
-        DecryptionTaskData, EncryptionTaskData, NetworkTaskData, DECRYPTED_RING_BUFFER,
-        ENCRYPTED_RING_BUFFER, PLAINTEXT_RING_BUFFER,
-    },
-    NeptunResult, PacketData, Tunn,
+    ring_buffers::{DecryptionTaskData, EncryptionTaskData, PLAINTEXT_RING_BUFFER, RX_RING_BUFFER},
+    NeptunResult, Tunn,
 };
 use crate::noise::errors::WireGuardError;
 use crossbeam::channel::{Receiver, Sender};
@@ -279,45 +276,30 @@ impl Session {
     }
 
     pub fn decrypt_data_worker(
-        decrypt_rx: Receiver<&DecryptionTaskData>,
-        tunnel_tx: Sender<&NetworkTaskData>,
+        decrypt_rx: Receiver<usize>,
+        tunnel_tx: Sender<&DecryptionTaskData>,
     ) {
-        while let Ok(decryption_data) = decrypt_rx.recv() {
-            let (network_data, _) = unsafe { DECRYPTED_RING_BUFFER.get_next() };
-            loop {
-                if network_data.is_element_free.load(Ordering::Relaxed) {
-                    let data_len = decryption_data.buf_len;
-                    let decapsulated_packet = Session::decrypt_data_pkt(
-                        PacketData {
-                            receiver_idx: u32::from_le_bytes(
-                                decryption_data.data[4..8].try_into().unwrap(),
-                            ),
-                            counter: decryption_data.counter,
-                            encrypted_encapsulated_packet: &decryption_data.data[16..data_len],
-                        },
-                        decryption_data.receiving_index,
-                        decryption_data.receiver.as_ref().unwrap().clone(),
-                        decryption_data.receiving_key_counter.clone(),
-                        network_data.data.as_mut_slice(),
-                    );
-                    network_data.res = match decapsulated_packet {
-                        Ok(len) => Tunn::validate_decapsulated_packet(
-                            &mut network_data.data.as_mut_slice()[..len],
-                        ),
-                        Err(e) => NeptunResult::Err(e),
-                    };
-                    // TODO: The rx bytes and timer update is done right now
-                    // in the send_to_tunnel thread. Maybe not the best place to do it.
-                    // Overall this needs to be revisited
-                    network_data.peer = Some(decryption_data.peer.as_ref().unwrap().clone());
-                    decryption_data
-                        .is_element_free
-                        .store(true, Ordering::Relaxed);
-                    network_data.is_element_free.store(false, Ordering::Relaxed);
-                    let _ = tunnel_tx.send(network_data);
-                    break;
-                }
-            }
+        while let Ok(iter) = decrypt_rx.recv() {
+            let decryption_data = unsafe { &mut RX_RING_BUFFER.ring_buffer[iter] };
+            let pkt_len = decryption_data.buf_len;
+            let decapsulated_packet = Session::decrypt_data_pkt(
+                decryption_data.receiving_index,
+                decryption_data.receiver.as_ref().unwrap().clone(),
+                decryption_data.receiving_key_counter.clone(),
+                decryption_data.data.as_mut_slice(),
+                pkt_len,
+                decryption_data.counter,
+            );
+            decryption_data.res = match decapsulated_packet {
+                Ok(len) => Tunn::validate_decapsulated_packet(
+                    &mut decryption_data.data.as_mut_slice()[..len],
+                ),
+                Err(e) => NeptunResult::Err(e),
+            };
+            // TODO: The rx bytes and timer update is done right now
+            // in the send_to_tunnel thread. Maybe not the best place to do it.
+            // Overall this needs to be revisited
+            let _ = tunnel_tx.send(decryption_data);
         }
     }
 
@@ -326,39 +308,41 @@ impl Session {
     ///       dst will always take less space than src
     /// return the size of the encapsulated packet on success
     pub fn decrypt_data_pkt(
-        packet: PacketData,
         receiving_index: u32,
         receiver: Arc<LessSafeKey>,
         receiving_key_counter: Arc<Mutex<ReceivingKeyCounterValidator>>,
-        dst: &mut [u8],
+        buffer: &mut [u8],
+        pkt_len: usize,
+        counter: u64,
     ) -> Result<usize, WireGuardError> {
-        let ct_len = packet.encrypted_encapsulated_packet.len();
-        if dst.len() < ct_len {
+        let pkt_receiver_idx = u32::from_le_bytes(buffer[4..8].try_into().unwrap());
+
+        let ct_len = pkt_len - DATA_OFFSET;
+        if buffer.len() < ct_len {
             // This is a very incorrect use of the library, therefore panic and not error
             panic!("The destination buffer is too small");
         }
-        if packet.receiver_idx != receiving_index {
-            tracing::debug!("pkt rx {} rx_idx {}", packet.receiver_idx, receiving_index);
+        if pkt_receiver_idx != receiving_index {
+            tracing::debug!("pkt rx {} rx_idx {}", pkt_receiver_idx, receiving_index);
             return Err(WireGuardError::WrongIndex);
         }
         // Don't reuse counters, in case this is a replay attack we want to quickly check the counter without running expensive decryption
-        Session::receiving_counter_quick_check(receiving_key_counter.clone(), packet.counter)?;
+        Session::receiving_counter_quick_check(receiving_key_counter.clone(), counter)?;
 
         let ret = {
             let mut nonce = [0u8; 12];
-            nonce[4..12].copy_from_slice(&packet.counter.to_le_bytes());
-            dst[..ct_len].copy_from_slice(packet.encrypted_encapsulated_packet);
+            nonce[4..12].copy_from_slice(&counter.to_le_bytes());
             receiver
                 .open_in_place(
                     Nonce::assume_unique_for_key(nonce),
                     Aad::from(&[]),
-                    &mut dst[..ct_len],
+                    &mut buffer[DATA_OFFSET..pkt_len],
                 )
                 .map_err(|_| WireGuardError::InvalidAeadTag)?
         };
 
         // After decryption is done, check counter again, and mark as received
-        Session::receiving_counter_mark(receiving_key_counter.clone(), packet.counter)?;
+        Session::receiving_counter_mark(receiving_key_counter.clone(), counter)?;
         Ok(ret.len())
     }
 
@@ -400,8 +384,7 @@ mod tests {
             item.sending_key_counter = session.sending_key_counter.clone();
         }
         let _ = tx.send(iter);
-        if rx1.recv().is_ok() {
-            let (en_msg, _) = unsafe { ENCRYPTED_RING_BUFFER.get_next() };
+        if let Ok(en_msg) = rx1.recv() {
             let src = &en_msg.data[..en_msg.buf_len];
             println!("encrypted data {:?}", src);
         }

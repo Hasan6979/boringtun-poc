@@ -40,16 +40,15 @@ use crate::noise::errors::WireGuardError;
 use crate::noise::handshake::parse_handshake_anon;
 use crate::noise::rate_limiter::RateLimiter;
 use crate::noise::ring_buffers::{
-    DecryptionTaskData, EncryptionTaskData, NetworkTaskData, ENCRYPTED_RING_BUFFER,
-    PLAINTEXT_RING_BUFFER, RB_SIZE, RX_RING_BUFFER,
+    DecryptionTaskData, EncryptionTaskData, NetworkTaskData, PLAINTEXT_RING_BUFFER, RB_SIZE,
+    RX_RING_BUFFER,
 };
 use crate::noise::session::Session;
 use crate::noise::timers::TimerName;
-use crate::noise::{NeptunResult, Packet, Tunn, TunnResult, IFACE_ITER};
+use crate::noise::{NeptunResult, Packet, Tunn, TunnResult};
 use crate::x25519;
 use allowed_ips::AllowedIps;
 use crossbeam::channel::{Receiver, Sender};
-use once_cell::sync::Lazy;
 use peer::{AllowedIP, Peer};
 use poll::{EventPoll, EventRef, WaitResult};
 use rand_core::{OsRng, RngCore};
@@ -177,8 +176,6 @@ pub struct Device {
     #[cfg(target_os = "linux")]
     uapi_fd: i32,
 }
-
-static mut TUN_ITER: usize = 0;
 
 struct ThreadData {
     iface: Arc<TunSocket>,
@@ -655,7 +652,7 @@ impl Device {
                 // let src_buf =
                     // unsafe { &mut *(&mut t.src_buf[..] as *mut [u8] as *mut [MaybeUninit<u8>]) };
                 loop {
-                    let element = unsafe { &mut RX_RING_BUFFER[TUN_ITER] };
+                    let element = unsafe { RX_RING_BUFFER.get_next() };
                     if element.is_element_free.load(Ordering::Relaxed) {
                             let src_buf =
                             unsafe { &mut *(&mut element.data[..] as *mut [u8] as *mut [MaybeUninit<u8>]) };
@@ -717,12 +714,6 @@ impl Device {
                                         tun.mark_timer_to_update(TimerName::TimeLastPacketReceived);
                                         element.is_element_free.store(false, Ordering::Relaxed);
                                         let _ = d.decyrpt_tx.send(element);
-                                        if unsafe { TUN_ITER != (RB_SIZE - 1) } {
-                                            unsafe { TUN_ITER += 1 };
-                                        } else {
-                                            // Reset the write iterator
-                                            unsafe { TUN_ITER = 0 };
-                                        }
                                         TunnResult::Done},
                                     None => {tracing::trace!(message = "No current session available", remote_idx = r_idx);
                                         TunnResult::Err(WireGuardError::NoCurrentSession)}
@@ -889,7 +880,7 @@ impl Device {
 
                 let peers = &d.peers_by_ip;
                 for _ in 0..MAX_ITR {
-                    let element = unsafe { &mut PLAINTEXT_RING_BUFFER[IFACE_ITER] };
+                    let element = unsafe { PLAINTEXT_RING_BUFFER.get_next() };
                     if element.is_element_free.load(Ordering::Relaxed) {
                         let len = match iface.read(&mut element.data[..mtu]) {
                             Ok(src) => src.len(),

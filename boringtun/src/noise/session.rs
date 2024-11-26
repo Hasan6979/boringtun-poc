@@ -4,7 +4,7 @@
 use super::{
     ring_buffers::{
         DecryptionTaskData, EncryptionTaskData, NetworkTaskData, DECRYPTED_RING_BUFFER,
-        ENCRYPTED_RING_BUFFER, PLAINTEXT_RING_BUFFER, RB_SIZE,
+        ENCRYPTED_RING_BUFFER, PLAINTEXT_RING_BUFFER,
     },
     NeptunResult, PacketData, Tunn,
 };
@@ -28,9 +28,6 @@ pub struct Session {
     pub sending_key_counter: Arc<AtomicUsize>,
     pub receiving_key_counter: Arc<Mutex<ReceivingKeyCounterValidator>>,
 }
-
-static mut ENCRYPT_ITER: usize = 0;
-static mut DECRYPT_ITER: usize = 0;
 
 impl std::fmt::Debug for Session {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
@@ -219,7 +216,7 @@ impl Session {
         network_tx: Sender<&NetworkTaskData>,
     ) {
         while let Ok(encryption_data) = encrypt_rx.recv() {
-            let network_data = unsafe { &mut ENCRYPTED_RING_BUFFER[ENCRYPT_ITER] };
+            let network_data = unsafe { ENCRYPTED_RING_BUFFER.get_next() };
             loop {
                 if network_data.is_element_free.load(Ordering::Relaxed) {
                     let data_len = encryption_data.buf_len;
@@ -238,12 +235,6 @@ impl Session {
                     let _ = network_tx.send(network_data);
                     break;
                 }
-            }
-            if unsafe { ENCRYPT_ITER != (RB_SIZE - 1) } {
-                unsafe { ENCRYPT_ITER += 1 };
-            } else {
-                // Reset the write iterator
-                unsafe { ENCRYPT_ITER = 0 };
             }
             encryption_data
                 .is_element_free
@@ -301,7 +292,7 @@ impl Session {
         tunnel_tx: Sender<&NetworkTaskData>,
     ) {
         while let Ok(decryption_data) = decrypt_rx.recv() {
-            let network_data = unsafe { &mut DECRYPTED_RING_BUFFER[DECRYPT_ITER] };
+            let network_data = unsafe { DECRYPTED_RING_BUFFER.get_next() };
             loop {
                 if network_data.is_element_free.load(Ordering::Relaxed) {
                     let data_len = decryption_data.buf_len;
@@ -329,12 +320,6 @@ impl Session {
                     // self.timer_tick(TimerName::TimeLastDataPacketReceived);
                     // self.rx_bytes += computed_len;
                     network_data.peer = Some(decryption_data.peer.as_ref().unwrap().clone());
-                    if unsafe { DECRYPT_ITER != (RB_SIZE - 1) } {
-                        unsafe { DECRYPT_ITER += 1 };
-                    } else {
-                        // Reset the write iterator
-                        unsafe { DECRYPT_ITER = 0 };
-                    }
                     decryption_data
                         .is_element_free
                         .store(true, Ordering::Relaxed);
@@ -412,28 +397,23 @@ mod tests {
         std::thread::spawn(move || Session::encrypt_data_worker(rx_clone, tx1));
 
         // Generate some data
-        if let Some(item) = unsafe { PLAINTEXT_RING_BUFFER.get_mut(0) } {
-            {
-                let x = item.data.as_mut_slice();
-                for i in 0..10 {
-                    x[i] = i as u8;
-                }
-                item.sender = Some(session.sender.clone());
-                item.sending_index = session.sending_index;
-                item.buf_len = 10;
-                println!("data {:?}", &item.data[..item.buf_len]);
-                item.sending_key_counter = session.sending_key_counter.clone();
+        let item = unsafe { PLAINTEXT_RING_BUFFER.get_next() };
+        {
+            let x = item.data.as_mut_slice();
+            for i in 0..10 {
+                x[i] = i as u8;
             }
-            let _ = tx.send(item);
+            item.sender = Some(session.sender.clone());
+            item.sending_index = session.sending_index;
+            item.buf_len = 10;
+            println!("data {:?}", &item.data[..item.buf_len]);
+            item.sending_key_counter = session.sending_key_counter.clone();
         }
+        let _ = tx.send(item);
         if rx1.recv().is_ok() {
-            if let Some(en_msg) = unsafe { ENCRYPTED_RING_BUFFER.pop_back() } {
-                let src = &en_msg.data[..en_msg.buf_len];
-                println!("encrypted data {:?}", src);
-                unsafe {
-                    ENCRYPTED_RING_BUFFER.push_front(en_msg);
-                }
-            }
+            let en_msg = unsafe { ENCRYPTED_RING_BUFFER.get_next() };
+            let src = &en_msg.data[..en_msg.buf_len];
+            println!("encrypted data {:?}", src);
         }
     }
 

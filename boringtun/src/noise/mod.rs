@@ -11,7 +11,7 @@ pub mod timers;
 
 use crossbeam::channel::Sender;
 use parking_lot::{Mutex, RwLock};
-use ring_buffers::{EncryptionTaskData, NetworkTaskData, ENCRYPTED_RING_BUFFER, RB_SIZE};
+use ring_buffers::{EncryptionTaskData, NetworkTaskData, ENCRYPTED_RING_BUFFER};
 use session::Session;
 
 use crate::device::peer::Peer;
@@ -49,8 +49,6 @@ const IP_LEN_SZ: usize = 2;
 const MAX_QUEUE_DEPTH: usize = 256;
 /// number of sessions in the ring, better keep a PoT
 const N_SESSIONS: usize = 8;
-
-pub static mut IFACE_ITER: usize = 0;
 
 #[derive(Debug)]
 pub enum TunnResult<'a> {
@@ -314,39 +312,35 @@ impl Tunn {
             self.tx_bytes.fetch_add(len, Ordering::Relaxed);
             element.is_element_free.store(false, Ordering::Relaxed);
             let _ = self.encyrpt_tx.send(element);
-            if unsafe { IFACE_ITER != (RB_SIZE - 1) } {
-                unsafe { IFACE_ITER += 1 };
-            } else {
-                // Reset the write iterator
-                unsafe { IFACE_ITER = 0 };
-            }
-        } else {
-            // Q the packet
-            self.queue_packet(&element.data[..len]);
-            // Initiate handshake
-            // TODO: Have to fix this. This can't be a hardcoded 0th iter
-            if let Some(dst) = unsafe { ENCRYPTED_RING_BUFFER.get_mut(0) } {
-                {
-                    dst.peer = Some(peer.clone());
-                    let res = self.format_handshake_initiation(dst.data.as_mut_slice(), true);
-                    match res {
-                        NeptunResult::Done => return,
-                        NeptunResult::Err(e) => {
-                            tracing::error!(message = "Handshake initiation error", error = ?e);
-                            return;
-                        }
-                        NeptunResult::WriteToNetwork(n) => {
-                            dst.res = NeptunResult::WriteToNetwork(n)
-                        }
-                        _ => panic!("Unexpected result from handshake initiation"),
-                    }
-                };
-                // This has to change. Atm, can handle only 1 and only
-                // at the beginning
-                dst.is_element_free.store(false, Ordering::Relaxed);
-                let _ = self.network_tx.send(dst);
-            }
+            return;
         }
+
+        // Q the packet
+        self.queue_packet(&element.data[..len]);
+        // Initiate handshake
+        self.initiate_handshake(peer.clone(), false);
+    }
+
+    pub fn initiate_handshake(&self, peer: Arc<Peer>, force_resend: bool) {
+        // TODO: Have to fix this. This can't be a hardcoded 0th iter
+        let dst = unsafe { ENCRYPTED_RING_BUFFER.get_next() };
+        {
+            dst.peer = Some(peer.clone());
+            let res = self.format_handshake_initiation(dst.data.as_mut_slice(), force_resend);
+            match res {
+                NeptunResult::Done => return,
+                NeptunResult::Err(e) => {
+                    tracing::error!(message = "Handshake initiation error", error = ?e);
+                    return;
+                }
+                NeptunResult::WriteToNetwork(n) => dst.res = NeptunResult::WriteToNetwork(n),
+                _ => panic!("Unexpected result from handshake initiation"),
+            }
+        };
+        // This has to change. Atm, can handle only 1 and only
+        // at the beginning
+        dst.is_element_free.store(false, Ordering::Relaxed);
+        let _ = self.network_tx.send(dst);
     }
 
     /// Receives a UDP datagram from the network and parses it.

@@ -34,18 +34,24 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::thread::JoinHandle;
+use std::time::Instant;
 
 use crate::noise::errors::WireGuardError;
 use crate::noise::handshake::parse_handshake_anon;
 use crate::noise::rate_limiter::RateLimiter;
-use crate::noise::{Packet, Tunn, TunnResult};
+use crate::noise::ring_buffers::{
+    DecryptionTaskData, EncryptionTaskData, PLAINTEXT_RING_BUFFER, RB_SIZE, RX_RING_BUFFER,
+};
+use crate::noise::session::{Session, DATA_OFFSET};
+use crate::noise::timers::TimerName;
+use crate::noise::{NeptunResult, Packet, Tunn, TunnResult};
 use crate::x25519;
 use allowed_ips::AllowedIps;
-use parking_lot::Mutex;
+use crossbeam::channel::{Receiver, Sender};
 use peer::{AllowedIP, Peer};
 use poll::{EventPoll, EventRef, WaitResult};
 use rand_core::{OsRng, RngCore};
-use socket2::{Domain, Protocol, Type};
+use socket2::{Domain, Protocol, Socket, Type};
 use tun::TunSocket;
 
 use dev_lock::{Lock, LockReadGuard};
@@ -54,6 +60,8 @@ const HANDSHAKE_RATE_LIMIT: u64 = 100; // The number of handshakes per second we
 
 const MAX_UDP_SIZE: usize = (1 << 16) - 1;
 const MAX_ITR: usize = 100; // Number of packets to handle per handler call
+const WG_PORT: u16 = 53115;
+const N_SESSIONS: usize = 8;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -143,9 +151,9 @@ pub struct Device {
     yield_notice: Option<EventRef>,
     exit_notice: Option<EventRef>,
 
-    peers: HashMap<x25519::PublicKey, Arc<Mutex<Peer>>>,
-    peers_by_ip: AllowedIps<Arc<Mutex<Peer>>>,
-    peers_by_idx: HashMap<u32, Arc<Mutex<Peer>>>,
+    peers: HashMap<x25519::PublicKey, Arc<Peer>>,
+    peers_by_ip: AllowedIps<Arc<Peer>>,
+    peers_by_idx: HashMap<u32, Arc<Peer>>,
     next_index: IndexLfsr,
 
     config: DeviceConfig,
@@ -156,6 +164,14 @@ pub struct Device {
 
     rate_limiter: Option<Arc<RateLimiter>>,
 
+    encyrpt_tx: Sender<usize>,
+    decyrpt_tx: Sender<usize>,
+
+    network_rx: Receiver<&'static EncryptionTaskData>,
+    network_tx: Sender<&'static EncryptionTaskData>,
+
+    tunnel_rx: Receiver<&'static DecryptionTaskData>,
+    tunnel_tx: Sender<&'static DecryptionTaskData>,
     #[cfg(target_os = "linux")]
     uapi_fd: i32,
 }
@@ -170,7 +186,7 @@ impl DeviceHandle {
     pub fn new(name: &str, config: DeviceConfig) -> Result<DeviceHandle, Error> {
         let n_threads = config.n_threads;
         let mut wg_interface = Device::new(name, config)?;
-        wg_interface.open_listen_socket(0)?; // Start listening on a random port
+        wg_interface.open_listen_socket(WG_PORT)?; // Start listening on a random port
 
         let interface_lock = Arc::new(Lock::new(wg_interface));
 
@@ -288,12 +304,11 @@ impl Device {
         if let Some(peer) = self.peers.remove(pub_key) {
             // Found a peer to remove, now purge all references to it:
             {
-                let p = peer.lock();
-                p.shutdown_endpoint(); // close open udp socket and free the closure
-                self.peers_by_idx.remove(&p.index());
+                peer.shutdown_endpoint(); // close open udp socket and free the closure
+                self.peers_by_idx.remove(&peer.index());
             }
             self.peers_by_ip
-                .remove(&|p: &Arc<Mutex<Peer>>| Arc::ptr_eq(&peer, p));
+                .remove(&|p: &Arc<Peer>| Arc::ptr_eq(&peer, p));
 
             tracing::info!("Peer removed");
         }
@@ -334,11 +349,13 @@ impl Device {
             keepalive,
             next_index,
             None,
+            self.encyrpt_tx.clone(),
+            self.network_tx.clone(),
         );
 
         let peer = Peer::new(tunn, next_index, endpoint, allowed_ips, preshared_key);
 
-        let peer = Arc::new(Mutex::new(peer));
+        let peer = Arc::new(peer);
         self.peers.insert(pub_key, Arc::clone(&peer));
         self.peers_by_idx.insert(next_index, Arc::clone(&peer));
 
@@ -361,6 +378,11 @@ impl Device {
         let uapi_fd = -1;
         #[cfg(target_os = "linux")]
         let uapi_fd = config.uapi_fd;
+        let (encyrpt_tx, encrypt_rx) = crossbeam::channel::bounded(RB_SIZE);
+        let (network_tx, network_rx) = crossbeam::channel::bounded(RB_SIZE);
+
+        let (decyrpt_tx, decrypt_rx) = crossbeam::channel::bounded(RB_SIZE);
+        let (tunnel_tx, tunnel_rx) = crossbeam::channel::bounded(RB_SIZE);
 
         let mut device = Device {
             queue: Arc::new(poll),
@@ -380,6 +402,12 @@ impl Device {
             cleanup_paths: Default::default(),
             mtu: AtomicUsize::new(mtu),
             rate_limiter: None,
+            encyrpt_tx: encyrpt_tx.clone(),
+            network_tx: network_tx.clone(),
+            network_rx,
+            decyrpt_tx: decyrpt_tx.clone(),
+            tunnel_tx: tunnel_tx.clone(),
+            tunnel_rx,
             #[cfg(target_os = "linux")]
             uapi_fd,
         };
@@ -392,6 +420,12 @@ impl Device {
         device.register_iface_handler(Arc::clone(&device.iface))?;
         device.register_notifiers()?;
         device.register_timers()?;
+
+        let rx_clone = encrypt_rx.clone();
+        std::thread::spawn(move || Session::encrypt_data_worker(rx_clone, network_tx));
+
+        let rx_clone = decrypt_rx.clone();
+        std::thread::spawn(move || Session::decrypt_data_worker(rx_clone, tunnel_tx));
 
         #[cfg(target_os = "macos")]
         {
@@ -422,7 +456,7 @@ impl Device {
         }
 
         for peer in self.peers.values() {
-            peer.lock().shutdown_endpoint();
+            peer.shutdown_endpoint();
         }
 
         // Then open new sockets and bind to the port
@@ -443,9 +477,16 @@ impl Device {
 
         self.register_udp_handler(udp_sock4.try_clone().unwrap())?;
         self.register_udp_handler(udp_sock6.try_clone().unwrap())?;
-        self.udp4 = Some(udp_sock4);
-        self.udp6 = Some(udp_sock6);
-
+        self.udp4 = Some(udp_sock4.try_clone().unwrap());
+        self.udp6 = Some(udp_sock6.try_clone().unwrap());
+        // Send to network in a seperate thread
+        let rx_clone = self.network_rx.clone();
+        let uv4 = Arc::new(udp_sock4).clone();
+        let uv6 = Arc::new(udp_sock6).clone();
+        std::thread::spawn(move || send_to_network(rx_clone, uv4, uv6));
+        let iface = self.iface.clone();
+        let rx_clone = self.tunnel_rx.clone();
+        std::thread::spawn(move || send_to_tunnel(rx_clone, iface));
         self.listen_port = port;
 
         Ok(())
@@ -464,7 +505,7 @@ impl Device {
         let rate_limiter = Arc::new(RateLimiter::new(&public_key, HANDSHAKE_RATE_LIMIT));
 
         for peer in self.peers.values_mut() {
-            peer.lock().tunnel.set_static_private(
+            peer.tunnel.set_static_private(
                 private_key.clone(),
                 public_key,
                 Some(Arc::clone(&rate_limiter)),
@@ -490,7 +531,7 @@ impl Device {
 
         // Then on all currently connected sockets
         for peer in self.peers.values() {
-            if let Some(ref sock) = peer.lock().endpoint().conn {
+            if let Some(ref sock) = peer.endpoint().conn {
                 sock.set_mark(mark)?
             }
         }
@@ -543,16 +584,19 @@ impl Device {
 
                 // Go over each peer and invoke the timer function
                 for peer in peer_map.values() {
-                    let mut p = peer.lock();
-                    let endpoint_addr = match p.endpoint().addr {
+                    let endpoint_addr = match peer.endpoint().addr {
                         Some(addr) => addr,
                         None => continue,
                     };
 
-                    match p.update_timers(&mut t.dst_buf[..]) {
+                    let res = {
+                        let tun = &peer.tunnel;
+                        tun.update_timers(peer.clone())
+                    };
+                    match res {
                         TunnResult::Done => {}
                         TunnResult::Err(WireGuardError::ConnectionExpired) => {
-                            p.shutdown_endpoint(); // close open udp socket
+                            peer.shutdown_endpoint(); // close open udp socket
                         }
                         TunnResult::Err(e) => tracing::error!(message = "Timer error", error = ?e),
                         TunnResult::WriteToNetwork(packet) => {
@@ -604,15 +648,22 @@ impl Device {
 
                 // Safety: the `recv_from` implementation promises not to write uninitialised
                 // bytes to the buffer, so this casting is safe.
-                let src_buf =
-                    unsafe { &mut *(&mut t.src_buf[..] as *mut [u8] as *mut [MaybeUninit<u8>]) };
-                while let Ok((packet_len, addr)) = udp.recv_from(src_buf) {
-                    let packet = &t.src_buf[..packet_len];
+                // let src_buf =
+                    // unsafe { &mut *(&mut t.src_buf[..] as *mut [u8] as *mut [MaybeUninit<u8>]) };
+                loop {
+                    let (element, rb_iter) = unsafe { RX_RING_BUFFER.get_next() };
+                    if element.is_element_free.load(Ordering::Relaxed) {
+                            let src_buf =
+                            unsafe { &mut *(&mut element.data[..] as *mut [u8] as *mut [MaybeUninit<u8>]) };
+                if let Ok((packet_len, addr)) = udp.recv_from(src_buf) {
+                    let mut data_pkt = None;
+                    let packet = &element.data[..packet_len];
                     // The rate limiter initially checks mac1 and mac2, and optionally asks to send a cookie
+                    let mut dst_buf = [0u8; 4096];
                     let parsed_packet = match rate_limiter.verify_packet(
                         Some(addr.as_socket().unwrap().ip()),
                         packet,
-                        &mut t.dst_buf,
+                        &mut dst_buf, // this can be a simple stack array
                     ) {
                         Ok(packet) => packet,
                         Err(TunnResult::WriteToNetwork(cookie)) => {
@@ -632,7 +683,7 @@ impl Device {
                         }
                         Packet::HandshakeResponse(p) => d.peers_by_idx.get(&(p.receiver_idx >> 8)),
                         Packet::PacketCookieReply(p) => d.peers_by_idx.get(&(p.receiver_idx >> 8)),
-                        Packet::PacketData(p) => d.peers_by_idx.get(&(p.receiver_idx >> 8)),
+                        Packet::PacketData(p) => { data_pkt = Some(p); d.peers_by_idx.get(&(p.receiver_idx >> 8))},
                     };
 
                     let peer = match peer {
@@ -640,14 +691,38 @@ impl Device {
                         Some(peer) => peer,
                     };
 
-                    let mut p = peer.lock();
-
                     // We found a peer, use it to decapsulate the message+
                     let mut flush = false; // Are there packets to send from the queue?
-                    match p
-                        .tunnel
-                        .handle_verified_packet(parsed_packet, &mut t.dst_buf[..])
-                    {
+                    let res = {
+                        let tun = &peer.tunnel;
+                        if let Some(pkt) = data_pkt {
+                            let r_idx = pkt.receiver_idx as usize;
+                            let idx = r_idx % N_SESSIONS;
+                            // Get the (probably) right session
+                            {
+                                let session = tun.sessions.read();
+                                match session[idx].as_ref() {
+                                    Some(session) => {
+                                        element.counter = pkt.counter;
+                                        element.buf_len = packet_len;
+                                        element.receiving_index = session.receiving_index;
+                                        element.receiver = Some(session.receiver.clone());
+                                        element.receiving_key_counter = session.receiving_key_counter.clone();
+                                        element.peer = Some(peer.clone());
+                                        tun.set_current_session(r_idx);
+                                        tun.mark_timer_to_update(TimerName::TimeLastPacketReceived);
+                                        element.is_element_free.store(false, Ordering::Relaxed);
+                                        let _ = d.decyrpt_tx.send(rb_iter);
+                                        TunnResult::Done},
+                                    None => {tracing::trace!(message = "No current session available", remote_idx = r_idx);
+                                        TunnResult::Err(WireGuardError::NoCurrentSession)}
+                                }
+                            }
+                        } else {
+                            tun.handle_verified_packet(parsed_packet, &mut t.dst_buf[..])
+                        }
+                    };
+                    match res {
                         TunnResult::Done => {}
                         TunnResult::Err(_) => continue,
                         TunnResult::WriteToNetwork(packet) => {
@@ -655,12 +730,12 @@ impl Device {
                             let _: Result<_, _> = udp.send_to(packet, &addr);
                         }
                         TunnResult::WriteToTunnelV4(packet, addr) => {
-                            if p.is_allowed_ip(addr) {
+                            if peer.is_allowed_ip(addr) {
                                 t.iface.write4(packet);
                             }
                         }
                         TunnResult::WriteToTunnelV6(packet, addr) => {
-                            if p.is_allowed_ip(addr) {
+                            if peer.is_allowed_ip(addr) {
                                 t.iface.write6(packet);
                             }
                         }
@@ -668,19 +743,28 @@ impl Device {
 
                     if flush {
                         // Flush pending queue
-                        while let TunnResult::WriteToNetwork(packet) =
-                            p.tunnel.decapsulate(None, &[], &mut t.dst_buf[..])
-                        {
-                            let _: Result<_, _> = udp.send_to(packet, &addr);
+                        loop {
+                            let res = {
+                                let tun = &peer.tunnel;
+                                tun.decapsulate(None, &[], &mut t.dst_buf[..])
+                            };
+
+                            let TunnResult::WriteToNetwork(packet) = res else {
+                                break;
+                            };
+
+                            if let Err(err) = udp.send_to(packet, &addr) {
+                                tracing::warn!(message = "Failed to flush queue", error = ?err, dst = ?addr);
+                            }
                         }
                     }
 
                     // This packet was OK, that means we want to create a connected socket for this peer
                     let addr = addr.as_socket().unwrap();
                     let ip_addr = addr.ip();
-                    p.set_endpoint(addr);
+                    peer.set_endpoint(addr);
                     if d.config.use_connected_socket {
-                        if let Ok(sock) = p.connect_endpoint(d.listen_port, d.fwmark) {
+                        if let Ok(sock) = peer.connect_endpoint(d.listen_port, d.fwmark) {
                             d.register_conn_handler(Arc::clone(peer), sock, ip_addr)
                                 .unwrap();
                         }
@@ -690,7 +774,11 @@ impl Device {
                     if iter == 0 {
                         break;
                     }
+                } else {
+                    break;
                 }
+            }
+            }
                 Action::Continue
             }),
         )?;
@@ -699,7 +787,7 @@ impl Device {
 
     fn register_conn_handler(
         &self,
-        peer: Arc<Mutex<Peer>>,
+        peer: Arc<Peer>,
         udp: socket2::Socket,
         peer_addr: IpAddr,
     ) -> Result<(), Error> {
@@ -719,12 +807,16 @@ impl Device {
 
                 while let Ok(read_bytes) = udp.recv(src_buf) {
                     let mut flush = false;
-                    let mut p = peer.lock();
-                    match p.tunnel.decapsulate(
-                        Some(peer_addr),
-                        &t.src_buf[..read_bytes],
-                        &mut t.dst_buf[..],
-                    ) {
+                    let res = {
+                        let tun = &peer.tunnel;
+                        tun.decapsulate(
+                            Some(peer_addr),
+                            &t.src_buf[..read_bytes],
+                            &mut t.dst_buf[..],
+                        )
+                    };
+
+                    match res {
                         TunnResult::Done => {}
                         TunnResult::Err(e) => eprintln!("Decapsulate error {:?}", e),
                         TunnResult::WriteToNetwork(packet) => {
@@ -732,12 +824,12 @@ impl Device {
                             let _: Result<_, _> = udp.send(packet);
                         }
                         TunnResult::WriteToTunnelV4(packet, addr) => {
-                            if p.is_allowed_ip(addr) {
+                            if peer.is_allowed_ip(addr) {
                                 iface.write4(packet);
                             }
                         }
                         TunnResult::WriteToTunnelV6(packet, addr) => {
-                            if p.is_allowed_ip(addr) {
+                            if peer.is_allowed_ip(addr) {
                                 iface.write6(packet);
                             }
                         }
@@ -745,9 +837,16 @@ impl Device {
 
                     if flush {
                         // Flush pending queue
-                        while let TunnResult::WriteToNetwork(packet) =
-                            p.tunnel.decapsulate(None, &[], &mut t.dst_buf[..])
-                        {
+                        loop {
+                            let res = {
+                                let tun = &peer.tunnel;
+                                tun.decapsulate(None, &[], &mut t.dst_buf[..])
+                            };
+
+                            let TunnResult::WriteToNetwork(packet) = res else {
+                                break;
+                            };
+
                             let _: Result<_, _> = udp.send(packet);
                         }
                     }
@@ -766,7 +865,7 @@ impl Device {
     fn register_iface_handler(&self, iface: Arc<TunSocket>) -> Result<(), Error> {
         self.queue.new_event(
             iface.as_raw_fd(),
-            Box::new(move |d, t| {
+            Box::new(move |d, _t| {
                 // The iface_handler handles packets received from the WireGuard virtual network
                 // interface. The flow is as follows:
                 // * Read a packet
@@ -775,62 +874,109 @@ impl Device {
                 // * Send encapsulated packet to the peer's endpoint
                 let mtu = d.mtu.load(Ordering::Relaxed);
 
-                let udp4 = d.udp4.as_ref().expect("Not connected");
-                let udp6 = d.udp6.as_ref().expect("Not connected");
-
                 let peers = &d.peers_by_ip;
                 for _ in 0..MAX_ITR {
-                    let src = match iface.read(&mut t.src_buf[..mtu]) {
-                        Ok(src) => src,
-                        Err(Error::IfaceRead(e)) => {
-                            let ek = e.kind();
-                            if ek == io::ErrorKind::Interrupted || ek == io::ErrorKind::WouldBlock {
-                                break;
+                    let (element, iter) = unsafe { PLAINTEXT_RING_BUFFER.get_next() };
+                    if element.is_element_free.load(Ordering::Relaxed) {
+                        let len = match iface.read(&mut element.data[DATA_OFFSET..mtu]) {
+                            Ok(src) => src.len(),
+                            Err(Error::IfaceRead(e)) => {
+                                let ek = e.kind();
+                                if ek == io::ErrorKind::Interrupted
+                                    || ek == io::ErrorKind::WouldBlock
+                                {
+                                    break;
+                                }
+                                eprintln!("Fatal read error on tun interface: {:?}", e);
+                                return Action::Exit;
                             }
-                            eprintln!("Fatal read error on tun interface: {:?}", e);
-                            return Action::Exit;
-                        }
-                        Err(e) => {
-                            eprintln!("Unexpected error on tun interface: {:?}", e);
-                            return Action::Exit;
-                        }
-                    };
-
-                    let dst_addr = match Tunn::dst_address(src) {
-                        Some(addr) => addr,
-                        None => continue,
-                    };
-
-                    let mut peer = match peers.find(dst_addr) {
-                        Some(peer) => peer.lock(),
-                        None => continue,
-                    };
-
-                    match peer.tunnel.encapsulate(src, &mut t.dst_buf[..]) {
-                        TunnResult::Done => {}
-                        TunnResult::Err(e) => {
-                            tracing::error!(message = "Encapsulate error", error = ?e)
-                        }
-                        TunnResult::WriteToNetwork(packet) => {
-                            let mut endpoint = peer.endpoint_mut();
-                            if let Some(conn) = endpoint.conn.as_mut() {
-                                // Prefer to send using the connected socket
-                                let _: Result<_, _> = conn.write(packet);
-                            } else if let Some(addr @ SocketAddr::V4(_)) = endpoint.addr {
-                                let _: Result<_, _> = udp4.send_to(packet, &addr.into());
-                            } else if let Some(addr @ SocketAddr::V6(_)) = endpoint.addr {
-                                let _: Result<_, _> = udp6.send_to(packet, &addr.into());
-                            } else {
-                                tracing::error!("No endpoint");
+                            Err(e) => {
+                                eprintln!("Unexpected error on tun interface: {:?}", e);
+                                return Action::Exit;
                             }
-                        }
-                        _ => panic!("Unexpected result from encapsulate"),
-                    };
+                        };
+                        let dst_addr = match Tunn::dst_address(
+                            &element.data[DATA_OFFSET..len + DATA_OFFSET],
+                        ) {
+                            Some(addr) => addr,
+                            None => continue,
+                        };
+
+                        let peer = match peers.find(dst_addr) {
+                            Some(peer) => peer,
+                            None => continue,
+                        };
+                        let tun = &peer.tunnel;
+                        tun.encapsulate(len, element, iter, peer.clone());
+                    }
                 }
                 Action::Continue
             }),
         )?;
         Ok(())
+    }
+}
+
+fn send_to_tunnel(tunnel_rx: Receiver<&DecryptionTaskData>, iface: Arc<TunSocket>) {
+    while let Ok(msg) = tunnel_rx.recv() {
+        match &msg.res {
+            NeptunResult::Done => {}
+            NeptunResult::Err(e) => {
+                // TODO: Uncomment this.
+                // tracing::error!(message = "Decapsulate error", error = ?e)
+            }
+            NeptunResult::WriteToTunnelV4(buf_len, addr) => {
+                let peer = msg.peer.as_ref().unwrap();
+                peer.tunnel.rx_bytes.fetch_add(*buf_len, Ordering::Relaxed);
+                peer.tunnel
+                    .mark_timer_to_update(TimerName::TimeLastDataPacketReceived);
+                if peer.is_allowed_ip(*addr) {
+                    iface.write4(&msg.data.as_slice()[DATA_OFFSET..*buf_len + DATA_OFFSET]);
+                }
+            }
+            NeptunResult::WriteToTunnelV6(buf_len, addr) => {
+                let peer = msg.peer.as_ref().unwrap();
+                peer.tunnel.rx_bytes.fetch_add(*buf_len, Ordering::Relaxed);
+                peer.tunnel
+                    .mark_timer_to_update(TimerName::TimeLastDataPacketReceived);
+                if peer.is_allowed_ip(*addr) {
+                    iface.write6(&msg.data.as_slice()[DATA_OFFSET..*buf_len + DATA_OFFSET]);
+                }
+            }
+            _ => panic!("Unexpected result from encapsulate"),
+        };
+        msg.is_element_free.store(true, Ordering::Relaxed);
+    }
+}
+
+fn send_to_network(
+    network_rx: Receiver<&EncryptionTaskData>,
+    udp4: Arc<Socket>,
+    udp6: Arc<Socket>,
+) {
+    while let Ok(msg) = network_rx.recv() {
+        match &msg.res {
+            NeptunResult::Done => {}
+            NeptunResult::Err(e) => {
+                tracing::error!(message = "Encapsulate error", error = ?e)
+            }
+            NeptunResult::WriteToNetwork(len) => {
+                let mut endpoint = msg.peer.as_ref().unwrap().endpoint_mut();
+                let packet = &msg.data.as_slice()[..*len];
+                if let Some(conn) = endpoint.conn.as_mut() {
+                    // Prefer to send using the connected socket
+                    let _: Result<_, _> = conn.write(packet);
+                } else if let Some(addr @ SocketAddr::V4(_)) = endpoint.addr {
+                    let _: Result<_, _> = udp4.send_to(packet, &addr.into());
+                } else if let Some(addr @ SocketAddr::V6(_)) = endpoint.addr {
+                    let _: Result<_, _> = udp6.send_to(packet, &addr.into());
+                } else {
+                    tracing::error!("No endpoint");
+                }
+            }
+            _ => panic!("Unexpected result from encapsulate"),
+        };
+        msg.is_element_free.store(true, Ordering::Relaxed);
     }
 }
 

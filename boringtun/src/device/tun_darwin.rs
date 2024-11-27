@@ -223,7 +223,7 @@ impl TunSocket {
         self.write(src, AF_INET6 as u8)
     }
 
-    pub fn read<'a>(&self, dst: &'a mut [u8]) -> Result<&'a mut [u8], Error> {
+    pub fn read<'a>(&self, dst: &'a mut [u8]) -> Result<&'a [u8], Error> {
         let mut hdr = [0u8; 4];
 
         let mut iov = [

@@ -928,7 +928,7 @@ fn send_to_tunnel(tunnel_rx: Receiver<&DecryptionTaskData>, iface: Arc<TunSocket
                 peer.tunnel
                     .mark_timer_to_update(TimerName::TimeLastDataPacketReceived);
                 if peer.is_allowed_ip(*addr) {
-                    iface.write4(&msg.data.as_slice()[..*buf_len]);
+                    iface.write4(&msg.data.as_slice()[DATA_OFFSET..*buf_len + DATA_OFFSET]);
                 }
             }
             NeptunResult::WriteToTunnelV6(buf_len, addr) => {
@@ -937,7 +937,7 @@ fn send_to_tunnel(tunnel_rx: Receiver<&DecryptionTaskData>, iface: Arc<TunSocket
                 peer.tunnel
                     .mark_timer_to_update(TimerName::TimeLastDataPacketReceived);
                 if peer.is_allowed_ip(*addr) {
-                    iface.write6(&msg.data.as_slice()[..*buf_len]);
+                    iface.write6(&msg.data.as_slice()[DATA_OFFSET..*buf_len + DATA_OFFSET]);
                 }
             }
             _ => panic!("Unexpected result from encapsulate"),

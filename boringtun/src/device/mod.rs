@@ -922,7 +922,8 @@ fn send_to_tunnel(tunnel_rx: Receiver<&DecryptionTaskData>, iface: Arc<TunSocket
         match &msg.res {
             NeptunResult::Done => {}
             NeptunResult::Err(e) => {
-                tracing::error!(message = "Decapsulate error", error = ?e)
+                // TODO: Uncomment this.
+                // tracing::error!(message = "Decapsulate error", error = ?e)
             }
             NeptunResult::WriteToTunnelV4(buf_len, addr) => {
                 let peer = msg.peer.as_ref().unwrap();

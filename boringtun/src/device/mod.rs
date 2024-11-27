@@ -895,7 +895,9 @@ impl Device {
                                 return Action::Exit;
                             }
                         };
-                        let dst_addr = match Tunn::dst_address(&element.data[DATA_OFFSET..len]) {
+                        let dst_addr = match Tunn::dst_address(
+                            &element.data[DATA_OFFSET..len + DATA_OFFSET],
+                        ) {
                             Some(addr) => addr,
                             None => continue,
                         };

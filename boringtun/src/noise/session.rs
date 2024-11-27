@@ -290,19 +290,9 @@ impl Session {
                 decryption_data.counter,
             );
             decryption_data.res = match decapsulated_packet {
-                Ok(len) => {
-                    if len == 0 {
-                        // For keepalive, len is 0
-                        Tunn::validate_decapsulated_packet(
-                            &mut decryption_data.data.as_mut_slice()[..len],
-                        )
-                    } else {
-                        Tunn::validate_decapsulated_packet(
-                            &mut decryption_data.data.as_mut_slice()
-                                [DATA_OFFSET..len + DATA_OFFSET],
-                        )
-                    }
-                }
+                Ok(len) => Tunn::validate_decapsulated_packet(
+                    &mut decryption_data.data.as_mut_slice()[DATA_OFFSET..len + DATA_OFFSET],
+                ),
                 Err(e) => NeptunResult::Err(e),
             };
             // TODO: The rx bytes and timer update is done right now

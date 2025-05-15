@@ -1,11 +1,5 @@
 name: PR Status Checks
 
-on:
-  push:
-    branches: [ "master" ]
-  pull_request:
-    branches: [ "master" ]
-
 jobs:
   # Depends on all actions that are required for a "successful" CI run.
   # Based on the ci here: https://github.com/tokio-rs/tokio/blob/master/.github/workflows/ci.yml

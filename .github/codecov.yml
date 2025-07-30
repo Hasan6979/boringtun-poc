@@ -1,0 +1,14 @@
+codecov:
+  max_report_age: 1
+  require_ci_to_pass: false
+  token: 673e882c-66f0-41d1-b722-b02caa719b76
+  notify:
+    wait_for_ci: false
+
+coverage:
+  precision: 1
+  round: "nearest"
+  status:
+    project:
+      default:
+        informational: true
